@@ -27,3 +27,22 @@ pnpm dist:win       # 打包 Windows 安装包
 pnpm dist:mac       # 打包 macOS 安装包
 pnpm lint
 ```
+
+## 实现要点
+
+- **离屏录制**：用 `BrowserWindow({ show:false, webPreferences:{ offscreen:true } })` 加载游戏，
+  通过 `webContents` 的 `paint` 事件取帧（BGRA）。
+- **跳过开屏并暴露全局**：游戏在生产模式下不暴露 `lib/game/_status`，且初始化会停在开屏等待
+  用户选择模式。本工具注入脚本通过向 IndexedDB 写入录像记录、`dev=true` 与 `mode`，并设置
+  `localStorage[noname_0.9_playback]`，使游戏初始化时直接进入录像播放、跳过开屏，同时由 `dev`
+  触发 `cheat.i()` 暴露全局，再原速播放。
+- **MP4 编码**：单独的隐藏「编码器」窗口经自定义 `app://` 协议加载 `mediabunny` 的 ESM bundle
+  （`file://` 下 `.mjs` 的 MIME 不被识别为模块，故必须用自定义协议），用 `CanvasSource`（H.264/avc）
+  + `Mp4OutputFormat` 编码逐帧画面并封装为 MP4。
+
+## 待补（发布前）
+
+- **应用图标**：当前使用 Electron 默认图标。发布前请在 `assets/` 放置 `icon.ico`（Windows）与
+  `icon.icns`（macOS），并在 `package.json` 的 `build.win.icon` / `build.mac.icon` 指回。
+- **下载页地址**：网页端 `videoExport.js` 的 `DOWNLOAD_URL` 仍为占位，需替换为本工具的真实下载页。
+
