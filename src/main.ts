@@ -1,8 +1,9 @@
 import { app, dialog } from "electron";
 import path from "path";
+import { PROTOCOL, parseProtocolUrl, type ExportPayload } from "./protocol";
 
 /**
- * 三梅杀录像导出工具 —— 主进程入口（脚手架阶段）。
+ * 三梅杀录像导出工具 —— 主进程入口。
  *
  * 设计要点：
  * - 本工具无前台界面：被网页端通过 sanmeikillrecordexporter://<base64> 协议拉起，
@@ -10,14 +11,11 @@ import path from "path";
  * - 唯一可见的系统级交互是「保存对话框」（选择导出路径与文件名）。
  * - 本工具仅供协议拉起使用：若用户直接打开（双击），弹原生提示并退出。
  *
- * 当前为脚手架：完成单实例锁 + 协议注册 + 协议 URL 捕获入口 + 「直接打开」拦截，
- * 协议解析 / WebSocket 服务 / 离屏录制等在后续微任务实现。
+ * 当前进度：单实例锁 + 协议注册 + 协议 URL 解析 + 「直接打开」拦截。
+ * WebSocket 服务 / 离屏录制等在后续微任务实现。
  */
 
-/** 自定义协议名（须与网页端 EXPORTER_PROTOCOL 一致）。 */
-const PROTOCOL = "sanmeikillrecordexporter";
-
-/** 是否已收到任何协议拉起（用于判断「直接打开」并提示退出）。 */
+/** 是否已收到任何有效的协议拉起（用于判断「直接打开」并提示退出）。 */
 let receivedProtocolUrl = false;
 
 // —— 单实例锁 ——
@@ -38,16 +36,29 @@ if (process.defaultApp) {
 
 /**
  * 处理一个协议 URL（sanmeikillrecordexporter://<base64>）。
- * 后续微任务：解析 payload → 起 WS → 弹保存对话框 → 离屏录制。
+ * 解析成功则启动导出流程；解析失败则忽略（视为无效拉起）。
  * @param url 协议 URL
  */
-function handleProtocolUrl(url: string | undefined): void {
-	if (!url || !url.startsWith(PROTOCOL + "://")) {
+function handleProtocolUrl(url: string | undefined | null): void {
+	const payload = parseProtocolUrl(url);
+	if (!payload) {
+		if (url) {
+			console.warn("[record-exporter] 无效的协议拉起，已忽略：", url);
+		}
 		return;
 	}
 	receivedProtocolUrl = true;
-	// TODO（后续微任务）：解析 payload 并启动导出流程。
-	console.log("[record-exporter] 收到协议拉起：", url);
+	startExport(payload);
+}
+
+/**
+ * 启动一次导出流程。
+ * 后续微任务：起 WS（来源校验）→ 弹保存对话框 → 离屏加载游戏 → 录制 → 写盘 → 汇报进度。
+ * @param payload 协议载荷
+ */
+function startExport(payload: ExportPayload): void {
+	// TODO（后续微任务）：启动 WebSocket 服务与离屏录制流程。
+	console.log("[record-exporter] 启动导出：", payload);
 }
 
 /**
