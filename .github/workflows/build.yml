@@ -1,0 +1,85 @@
+name: 构建与发布
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建（${{ matrix.os }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: "--win"
+          - os: macos-latest
+            args: "--mac"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 编译 TypeScript 与拷贝资源
+        run: pnpm build:ts
+
+      - name: 打包安装包
+        env:
+          # 应用版本始终为 package.json 中的 0.1.0；不进行 macOS 代码签名。
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm exec electron-builder ${{ matrix.args }} --publish never
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.os }}
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release（runId 作为版本）
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mapfile -t FILES < <(find artifacts -type f)
+          echo "待发布文件："
+          printf '  %s\n' "${FILES[@]}"
+          gh release create "${{ github.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.run_id }}" \
+            --notes "自动构建产物。Release 版本为本次工作流 runId（${{ github.run_id }}）；应用版本固定为 0.1.0。支持 Windows / macOS。" \
+            "${FILES[@]}"
