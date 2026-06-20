@@ -1,6 +1,7 @@
 import { app, dialog } from "electron";
 import path from "path";
 import { PROTOCOL, parseProtocolUrl, type ExportPayload } from "./protocol";
+import { startWsServer, type ExporterConnection, type VideoMessage } from "./wsServer";
 
 /**
  * 三梅杀录像导出工具 —— 主进程入口。
@@ -53,12 +54,51 @@ function handleProtocolUrl(url: string | undefined | null): void {
 
 /**
  * 启动一次导出流程。
- * 后续微任务：起 WS（来源校验）→ 弹保存对话框 → 离屏加载游戏 → 录制 → 写盘 → 汇报进度。
+ * 起 WS（来源校验）→ 收到录像 → 弹保存对话框 → 离屏加载游戏 → 录制 → 写盘 → 汇报进度。
  * @param payload 协议载荷
  */
 function startExport(payload: ExportPayload): void {
-	// TODO（后续微任务）：启动 WebSocket 服务与离屏录制流程。
-	console.log("[record-exporter] 启动导出：", payload);
+	let handled = false; // 一次拉起只处理一条录像
+	const closeServer = startWsServer(payload.listenport, payload.baseurl, {
+		onVideo: (msg, conn) => {
+			if (handled) {
+				return;
+			}
+			handled = true;
+			runExport(payload, msg, conn).finally(() => {
+				closeServer();
+				app.quit();
+			});
+		},
+	});
+}
+
+/**
+ * 执行实际导出：弹保存对话框 → （后续）离屏录制 → 写盘。
+ * @param payload 协议载荷
+ * @param msg 网页端发来的录像消息
+ * @param conn 向网页端汇报进度的连接
+ */
+async function runExport(payload: ExportPayload, msg: VideoMessage, conn: ExporterConnection): Promise<void> {
+	// 1. 不可见地弹出系统保存对话框（不绑定可见窗口）。
+	conn.progress("save", 0);
+	const defaultName = (msg.filename || "三梅杀录像").replace(/[\\/:*?"<>|]/g, "-") + ".mp4";
+	const result = await dialog.showSaveDialog({
+		title: "导出录像视频",
+		defaultPath: defaultName,
+		filters: [{ name: "MP4 视频", extensions: ["mp4"] }],
+	});
+	if (result.canceled || !result.filePath) {
+		conn.error("已取消保存");
+		return;
+	}
+	const savePath = result.filePath;
+
+	// TODO（后续微任务）：离屏加载游戏 → 注入录像 → 原速播放 → 截帧编码 → 写入 savePath。
+	console.log("[record-exporter] 保存路径：", savePath, "录像 payload 长度：", msg.payload.length);
+	conn.progress("record", 0);
+	// 暂以错误占位，待录制器接入后替换为真实流程。
+	conn.error("录制功能尚未接入（开发中）");
 }
 
 /**
