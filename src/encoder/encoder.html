@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<meta http-equiv="Content-Security-Policy" content="default-src 'self' app:; script-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob:;" />
+		<title>encoder</title>
+	</head>
+	<body>
+		<canvas id="frame" hidden></canvas>
+		<script type="module">
+			import { Output, Mp4OutputFormat, BufferTarget, CanvasSource, QUALITY_HIGH } from "/vendor/mediabunny.mjs";
+
+			const bridge = window.encoderBridge;
+			const canvas = document.getElementById("frame");
+			const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+			let output = null;
+			let source = null;
+			let imageData = null;
+			let frameWidth = 0;
+			let frameHeight = 0;
+			let fps = 30;
+			let encodedFrames = 0;
+
+			// 帧串行处理队列（尊重编码器/写入背压）。
+			const queue = [];
+			let draining = false;
+			let finishRequested = false;
+
+			function log(msg) {
+				try {
+					bridge.send({ type: "log", message: String(msg) });
+				} catch {}
+			}
+
+			async function init(msg) {
+				frameWidth = msg.width;
+				frameHeight = msg.height;
+				fps = msg.fps || 30;
+				canvas.width = frameWidth;
+				canvas.height = frameHeight;
+				imageData = ctx.createImageData(frameWidth, frameHeight);
+
+				output = new Output({
+					format: new Mp4OutputFormat({ fastStart: "in-memory" }),
+					target: new BufferTarget(),
+				});
+				source = new CanvasSource(canvas, {
+					codec: "avc",
+					bitrate: typeof msg.bitrate === "number" ? msg.bitrate : QUALITY_HIGH,
+				});
+				output.addVideoTrack(source, { frameRate: fps });
+				await output.start();
+				bridge.send({ type: "inited" });
+			}
+
+			// 将 BGRA 字节填入 RGBA 的 ImageData。
+			function drawBgra(bytes) {
+				const data = imageData.data;
+				const n = data.length;
+				for (let i = 0; i < n; i += 4) {
+					data[i] = bytes[i + 2]; // R <- B
+					data[i + 1] = bytes[i + 1]; // G
+					data[i + 2] = bytes[i]; // B <- R
+					data[i + 3] = bytes[i + 3]; // A
+				}
+				ctx.putImageData(imageData, 0, 0);
+			}
+
+			async function drain() {
+				if (draining) {
+					return;
+				}
+				draining = true;
+				try {
+					while (queue.length) {
+						const item = queue.shift();
+						const bytes = item.bytes instanceof Uint8Array ? item.bytes : new Uint8Array(item.bytes);
+						drawBgra(bytes);
+						await source.add(item.timestampSec, 1 / fps);
+						encodedFrames++;
+						if (encodedFrames % 15 === 0) {
+							bridge.send({ type: "progress", encodedFrames });
+						}
+					}
+				} catch (err) {
+					bridge.send({ type: "error", message: err && err.stack ? err.stack : String(err) });
+					draining = false;
+					return;
+				}
+				draining = false;
+				if (finishRequested && queue.length === 0) {
+					await finalize();
+				}
+			}
+
+			async function finalize() {
+				try {
+					await output.finalize();
+					const buffer = output.target.buffer;
+					bridge.send({ type: "done", buffer, encodedFrames }, [buffer]);
+				} catch (err) {
+					bridge.send({ type: "error", message: err && err.stack ? err.stack : String(err) });
+				}
+			}
+
+			bridge.onMessage(async msg => {
+				try {
+					if (msg.type === "init") {
+						await init(msg);
+					} else if (msg.type === "frame") {
+						queue.push({ bytes: msg.buffer, timestampSec: msg.timestampSec });
+						drain();
+					} else if (msg.type === "finish") {
+						finishRequested = true;
+						if (!draining && queue.length === 0) {
+							await finalize();
+						}
+					}
+				} catch (err) {
+					bridge.send({ type: "error", message: err && err.stack ? err.stack : String(err) });
+				}
+			});
+
+			bridge.send({ type: "ready" });
+		</script>
+	</body>
+</html>
