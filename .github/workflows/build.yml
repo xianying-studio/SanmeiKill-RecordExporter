@@ -81,5 +81,5 @@ jobs:
           gh release create "${{ github.run_id }}" \
             --repo "${{ github.repository }}" \
             --title "${{ github.run_id }}" \
-            --notes "自动构建产物。Release 版本为本次工作流 runId（${{ github.run_id }}）；应用版本固定为 0.1.0。支持 Windows / macOS。" \
+            --generate-notes \
             "${FILES[@]}"
