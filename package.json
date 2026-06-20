@@ -1,0 +1,58 @@
+{
+	"name": "sanmei-kill-record-exporter",
+	"productName": "三梅杀录像导出工具",
+	"version": "1.0.0",
+	"description": "三梅杀录像导出工具：被网页端通过 sanmeikillrecordexporter:// 协议拉起，在后台离屏录制录像并导出为 MP4 视频。支持 Windows / macOS。",
+	"main": "dist/main.js",
+	"type": "commonjs",
+	"author": "",
+	"license": "GPL-3.0-only",
+	"scripts": {
+		"build:ts": "tsc -p tsconfig.json",
+		"start": "pnpm build:ts && electron .",
+		"dist:win": "pnpm build:ts && electron-builder --win",
+		"dist:mac": "pnpm build:ts && electron-builder --mac",
+		"dist:all": "pnpm build:ts && electron-builder --win --mac",
+		"lint": "eslint src/**/*.ts"
+	},
+	"devDependencies": {
+		"@types/node": "^22.10.0",
+		"@types/ws": "^8.5.13",
+		"electron": "^33.2.0",
+		"electron-builder": "^25.1.8",
+		"typescript": "^5.7.2"
+	},
+	"dependencies": {
+		"mediabunny": "^1.49.0",
+		"ws": "^8.18.0"
+	},
+	"build": {
+		"appId": "com.sanmeikill.recordexporter",
+		"productName": "三梅杀录像导出工具",
+		"directories": {
+			"output": "release"
+		},
+		"files": ["dist/**/*", "assets/**/*", "package.json"],
+		"protocols": [
+			{
+				"name": "SanmeiKill Record Exporter",
+				"schemes": ["sanmeikillrecordexporter"]
+			}
+		],
+		"win": {
+			"target": ["nsis"],
+			"icon": "assets/icon.ico"
+		},
+		"mac": {
+			"target": ["dmg"],
+			"icon": "assets/icon.icns",
+			"category": "public.app-category.video"
+		},
+		"nsis": {
+			"oneClick": false,
+			"allowToChangeInstallationDirectory": true,
+			"createDesktopShortcut": false,
+			"createStartMenuShortcut": false
+		}
+	}
+}
