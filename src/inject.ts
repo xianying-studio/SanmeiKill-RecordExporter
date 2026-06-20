@@ -1,26 +1,24 @@
 /**
  * 注入到离屏游戏页（主世界）的驱动脚本构建器。
  *
- * 设计：脚本在每次页面加载/重载后都会被注入并执行，通过 sessionStorage 哨兵区分两个阶段。
+ * 关键背景（两点）：
+ * 1. 三梅杀在「非开发者模式」下不会把 lib/game/ui/_status 暴露到 window；仅当配置 dev=true 时，
+ *    初始化阶段才会调用 cheat.i() 暴露这些全局。
+ * 2. 初始化时若没有「待播放录像」标记，会停在开屏（splash）等待用户点击「启」选择模式，
+ *    离屏环境无人点击会永久卡住，初始化无法走到 cheat.i()。
  *
- * 阶段一（首次加载）：
- *   - 等待游戏核心就绪（lib/game/lib.db 可用）；
- *   - 把录像记录写入 IndexedDB 的 "video" 存储（keyPath: time）；
- *   - 设为原速播放（video_default_play_speed=1x）；
- *   - 调用 game.playVideo(time, mode) —— 内部会 reload 进入播放。
+ * 因此本脚本不调用需要全局的 game.playVideo，而是直接复刻其底层副作用：
+ *   - 向 IndexedDB 写入录像记录（video 存储，keyPath: time）；
+ *   - 向 IndexedDB 写入 config：mode=录像模式、dev=true、video_default_play_speed=1x；
+ *   - 设置 localStorage[`${prefix}playback`]=time —— 触发初始化时直接 importMode 跳过开屏，
+ *     并由模式自身的播放逻辑从 IndexedDB 读取录像并自动播放。
+ * 然后 reload。reload 后初始化跳过开屏、暴露全局、自动播放录像。
  *
- * 阶段二（reload 后，哨兵已置位）：
- *   - 轮询等待播放真正开始（_status.video 且 _status.event.video 就绪）；
- *   - 强制原速（_status.videoDuration=1）、隐藏播放控制条；
- *   - 回报 recording-start / progress；
- *   - _status.over 时回报 over。
- *
- * 与主进程的通信通过 preload 暴露的 window.__exporter.notify。
+ * 脚本每次页面加载后都会被重新注入，用 sessionStorage 哨兵区分「布置阶段」与「录制阶段」。
  */
-function injectBody(linkJson: string): void {
-	// 下面整段在游戏页主世界中执行；不能使用任何打包期变量，仅依赖运行时全局。
+function injectBody(linkJson: string, dbName: string, configPrefix: string): void {
 	const w = window as any;
-	const SENTINEL = "exporter_playback_armed";
+	const PLAY_ARMED = "exporter_play_armed";
 
 	function notify(m: any): void {
 		try {
@@ -30,33 +28,11 @@ function injectBody(linkJson: string): void {
 		}
 	}
 
-	function coreReady(): boolean {
-		return !!(w.lib && w.game && w.lib.init && w.lib.db && w.lib.configprefix !== undefined);
-	}
-
-	function waitFor(cond: () => boolean, ok: () => void, timeoutMs: number, onTimeout: () => void): void {
-		const start = Date.now();
-		const iv = setInterval(() => {
-			let ready = false;
-			try {
-				ready = cond();
-			} catch {
-				ready = false;
-			}
-			if (ready) {
-				clearInterval(iv);
-				ok();
-			} else if (Date.now() - start > timeoutMs) {
-				clearInterval(iv);
-				onTimeout();
-			}
-		}, 150);
-	}
-
-	// —— 阶段二：已布置，等待播放并录制 ——
-	if (sessionStorage.getItem(SENTINEL)) {
+	// —— 录制阶段：已布置并 reload，等待播放开始→采集进度→结束 ——
+	if (sessionStorage.getItem(PLAY_ARMED)) {
 		let started = false;
 		let total = 0;
+		notify({ type: "splash-done" });
 		const iv = setInterval(() => {
 			const s = w._status;
 			if (!s) {
@@ -65,7 +41,7 @@ function injectBody(linkJson: string): void {
 			if (s.video && s.event && Array.isArray(s.event.video)) {
 				if (!started) {
 					started = true;
-					total = s.event.video.length || 1;
+					total = Math.max(1, s.event.video.length);
 					s.videoDuration = 1;
 					try {
 						if (w.ui && w.ui.system) {
@@ -84,7 +60,7 @@ function injectBody(linkJson: string): void {
 			}
 			if (started && s.over) {
 				clearInterval(iv);
-				sessionStorage.removeItem(SENTINEL);
+				sessionStorage.removeItem(PLAY_ARMED);
 				// 给最后一帧留出渲染时间再结束。
 				setTimeout(() => notify({ type: "over" }), 500);
 			}
@@ -92,49 +68,58 @@ function injectBody(linkJson: string): void {
 		return;
 	}
 
-	// —— 阶段一：布置播放 ——
-	waitFor(
-		coreReady,
-		() => {
-			let link: any;
+	// —— 布置阶段：写录像 + 配置 + playback 标记，然后 reload ——
+	let link: any;
+	try {
+		link = JSON.parse(linkJson);
+	} catch {
+		notify({ type: "error", message: "录像数据解析失败" });
+		return;
+	}
+	if (!link || link.time === undefined || !link.mode || !link.video) {
+		notify({ type: "error", message: "录像数据不完整" });
+		return;
+	}
+
+	try {
+		const req = indexedDB.open(dbName, 4);
+		req.onsuccess = () => {
+			const db = req.result;
 			try {
-				link = JSON.parse(linkJson);
-			} catch {
-				notify({ type: "error", message: "录像数据解析失败" });
-				return;
-			}
-			if (!link || link.time === undefined || !link.mode || !link.video) {
-				notify({ type: "error", message: "录像数据不完整" });
-				return;
-			}
-			try {
-				const store = w.lib.db.transaction(["video"], "readwrite").objectStore("video");
-				const req = store.put(link);
-				req.onsuccess = () => {
+				const tx = db.transaction(["video", "config"], "readwrite");
+				const videoStore = tx.objectStore("video");
+				const configStore = tx.objectStore("config");
+				videoStore.put(link);
+				configStore.put(link.mode, "mode");
+				configStore.put(true, "dev");
+				configStore.put("1x", "video_default_play_speed");
+				tx.oncomplete = () => {
 					try {
-						notify({ type: "splash-done" });
-						sessionStorage.setItem(SENTINEL, "1");
-						w.game.saveConfig("video_default_play_speed", "1x");
-						w.game.playVideo(String(link.time), link.mode);
+						localStorage.setItem(configPrefix + "playbackmode", link.mode);
+						localStorage.setItem(configPrefix + "playback", String(link.time));
+						sessionStorage.setItem(PLAY_ARMED, "1");
+						location.reload();
 					} catch (e) {
-						notify({ type: "error", message: "启动播放失败：" + e });
+						notify({ type: "error", message: "设置播放标记失败：" + e });
 					}
 				};
-				req.onerror = () => notify({ type: "error", message: "写入录像失败" });
+				tx.onerror = () => notify({ type: "error", message: "写入录像/配置失败" });
 			} catch (e) {
-				notify({ type: "error", message: "IndexedDB 不可用：" + e });
+				notify({ type: "error", message: "IndexedDB 事务失败：" + e });
 			}
-		},
-		60000,
-		() => notify({ type: "error", message: "游戏加载超时" })
-	);
+		};
+		req.onerror = () => notify({ type: "error", message: "打开游戏数据库失败" });
+	} catch (e) {
+		notify({ type: "error", message: "IndexedDB 不可用：" + e });
+	}
 }
 
 /**
  * 构建可经 webContents.executeJavaScript 注入的脚本字符串。
  * @param linkJson 录像记录的 JSON 字符串（由 base64 payload 解码而来）
+ * @param dbName 游戏 IndexedDB 数据库名（如 noname_0.9_data）
+ * @param configPrefix 游戏配置前缀（如 noname_0.9_）
  */
-export function buildInjectScript(linkJson: string): string {
-	// 以 JSON.stringify 将录像 JSON 安全嵌入为 JS 字符串字面量。
-	return `(${injectBody.toString()})(${JSON.stringify(linkJson)});`;
+export function buildInjectScript(linkJson: string, dbName: string, configPrefix: string): string {
+	return `(${injectBody.toString()})(${JSON.stringify(linkJson)}, ${JSON.stringify(dbName)}, ${JSON.stringify(configPrefix)});`;
 }

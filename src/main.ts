@@ -31,6 +31,10 @@ const RECORD_WIDTH = 1280;
 const RECORD_HEIGHT = 720;
 const RECORD_FPS = 30;
 
+/** 游戏 IndexedDB 数据库名与配置前缀（configprefix 固定为 noname_0.9_）。 */
+const GAME_DB_NAME = "noname_0.9_data";
+const GAME_CONFIG_PREFIX = "noname_0.9_";
+
 // —— 单实例锁 ——
 // 通过协议二次拉起时，应复用已运行实例（Windows 经 second-instance 传 argv）。
 const gotTheLock = app.requestSingleInstanceLock();
@@ -123,7 +127,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 	}
 
 	// 3. 离屏加载游戏、注入驱动脚本、原速播放并逐帧编码为 MP4。
-	const injectScript = buildInjectScript(linkJson);
+	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX);
 	try {
 		const buffer = await recordOffscreen({
 			url: payload.baseurl,
