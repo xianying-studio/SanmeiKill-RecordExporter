@@ -2,7 +2,7 @@
 	"name": "sanmei-kill-record-exporter",
 	"productName": "三梅杀录像导出工具",
 	"version": "0.1.0",
-	"description": "三梅杀录像导出工具，支持将录像文件导出为视频。",
+	"description": "三梅杀录像导出工具：将《三梅杀》录像文件导出为视频",
 	"main": "dist/main.js",
 	"type": "commonjs",
 	"author": "",
