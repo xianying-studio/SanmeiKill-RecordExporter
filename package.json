@@ -1,8 +1,8 @@
 {
 	"name": "sanmei-kill-record-exporter",
 	"productName": "三梅杀录像导出工具",
-	"version": "1.0.0",
-	"description": "三梅杀录像导出工具：被网页端通过 sanmeikillrecordexporter:// 协议拉起，在后台离屏录制录像并导出为 MP4 视频。支持 Windows / macOS。",
+	"version": "0.1.0",
+	"description": "三梅杀录像导出工具，支持将录像文件导出为视频。",
 	"main": "dist/main.js",
 	"type": "commonjs",
 	"author": "",
@@ -44,9 +44,11 @@
 			}
 		],
 		"win": {
+			"icon": "assets/icon.ico",
 			"target": ["nsis"]
 		},
 		"mac": {
+			"icon": "assets/icon.png",
 			"target": ["dmg"],
 			"category": "public.app-category.video"
 		},

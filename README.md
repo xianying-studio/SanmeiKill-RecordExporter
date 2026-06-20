@@ -40,9 +40,18 @@ pnpm lint
   （`file://` 下 `.mjs` 的 MIME 不被识别为模块，故必须用自定义协议），用 `CanvasSource`（H.264/avc）
   + `Mp4OutputFormat` 编码逐帧画面并封装为 MP4。
 
-## 待补（发布前）
+## 持续集成与发布
 
-- **应用图标**：当前使用 Electron 默认图标。发布前请在 `assets/` 放置 `icon.ico`（Windows）与
-  `icon.icns`（macOS），并在 `package.json` 的 `build.win.icon` / `build.mac.icon` 指回。
-- **下载页地址**：网页端 `videoExport.js` 的 `DOWNLOAD_URL` 仍为占位，需替换为本工具的真实下载页。
+仓库配置了 GitHub Actions（`.github/workflows/build.yml`）：推送到 `master`/`main` 或手动触发时，
+在 Windows 与 macOS 运行器上分别打包 `nsis` / `dmg` 安装包，并创建一个 Release。
+
+- **应用版本固定为 `0.1.0`**（`package.json` 的 `version`）。
+- **Release 的版本（tag 与标题）为本次工作流的 `runId`**，因此每次构建都会生成独立的 Release，
+  `releases/latest` 始终指向最新一次成功构建。
+
+## 图标
+
+- Windows：`assets/icon.ico`（256×256）。
+- macOS：`assets/icon.png`（由 `icon.ico` 放大生成的 512×512，满足 electron-builder 生成 `.icns` 的尺寸要求）。
+
 
