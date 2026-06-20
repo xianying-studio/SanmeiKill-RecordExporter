@@ -1,7 +1,11 @@
 import { app, dialog } from "electron";
 import path from "path";
+import fs from "fs";
 import { PROTOCOL, parseProtocolUrl, type ExportPayload } from "./protocol";
 import { startWsServer, type ExporterConnection, type VideoMessage } from "./wsServer";
+import { registerAppScheme, handleAppScheme } from "./appProtocol";
+import { recordOffscreen } from "./recorder";
+import { buildInjectScript } from "./inject";
 
 /**
  * 三梅杀录像导出工具 —— 主进程入口。
@@ -19,12 +23,23 @@ import { startWsServer, type ExporterConnection, type VideoMessage } from "./wsS
 /** 是否已收到任何有效的协议拉起（用于判断「直接打开」并提示退出）。 */
 let receivedProtocolUrl = false;
 
+/** 是否正在导出（录制中临时窗口关闭不应触发整体退出）。 */
+let exporting = false;
+
+/** 录制画面尺寸与帧率（离屏窗口逻辑尺寸）。 */
+const RECORD_WIDTH = 1280;
+const RECORD_HEIGHT = 720;
+const RECORD_FPS = 30;
+
 // —— 单实例锁 ——
 // 通过协议二次拉起时，应复用已运行实例（Windows 经 second-instance 传 argv）。
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
 	app.quit();
 }
+
+// 注册 app:// 协议（必须在 app ready 之前声明），用于编码器窗口加载本地资源与 mediabunny。
+registerAppScheme();
 
 // 注册为该协议的默认处理程序（开发期 process.defaultApp 下需带 execPath/argv 参数）。
 if (process.defaultApp) {
@@ -65,9 +80,12 @@ function startExport(payload: ExportPayload): void {
 				return;
 			}
 			handled = true;
+			exporting = true;
 			runExport(payload, msg, conn).finally(() => {
+				exporting = false;
 				closeServer();
-				app.quit();
+				// 让最后的 WS 消息（done/error）有机会送达后再退出。
+				setTimeout(() => app.quit(), 300);
 			});
 		},
 	});
@@ -94,11 +112,36 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 	}
 	const savePath = result.filePath;
 
-	// TODO（后续微任务）：离屏加载游戏 → 注入录像 → 原速播放 → 截帧编码 → 写入 savePath。
-	console.log("[record-exporter] 保存路径：", savePath, "录像 payload 长度：", msg.payload.length);
-	conn.progress("record", 0);
-	// 暂以错误占位，待录制器接入后替换为真实流程。
-	conn.error("录制功能尚未接入（开发中）");
+	// 2. 解码录像 payload（base64(JSON.stringify(link))，与网页端 lib.init.encode 一致）。
+	let linkJson: string;
+	try {
+		linkJson = Buffer.from(msg.payload, "base64").toString("utf-8");
+		JSON.parse(linkJson); // 校验可解析
+	} catch {
+		conn.error("录像数据无效");
+		return;
+	}
+
+	// 3. 离屏加载游戏、注入驱动脚本、原速播放并逐帧编码为 MP4。
+	const injectScript = buildInjectScript(linkJson);
+	try {
+		const buffer = await recordOffscreen({
+			url: payload.baseurl,
+			injectScript,
+			width: RECORD_WIDTH,
+			height: RECORD_HEIGHT,
+			fps: RECORD_FPS,
+			onStage: (stage, percent) => conn.progress(stage, percent),
+			onLog: m => console.log("[record-exporter]", m),
+		});
+		// 4. 写盘并汇报完成。
+		await fs.promises.writeFile(savePath, buffer);
+		conn.progress("encode", 100);
+		conn.done();
+	} catch (e: any) {
+		console.error("[record-exporter] 录制失败：", e);
+		conn.error("录制失败：" + (e && e.message ? e.message : String(e)));
+	}
 }
 
 /**
@@ -132,6 +175,9 @@ app.on("open-url", (event, urlStr) => {
 });
 
 app.whenReady().then(() => {
+	// 挂载 app:// 协议处理器（编码器窗口与 mediabunny 资源经此加载）。
+	handleAppScheme();
+
 	// 首次启动即可能携带协议 URL（Windows 经 argv）。
 	handleProtocolUrl(getProtocolUrlFromArgv(process.argv));
 
@@ -144,6 +190,9 @@ app.whenReady().then(() => {
 });
 
 // 无可见窗口：所有窗口关闭后直接退出（macOS 也退出，因本工具非常驻）。
+// 录制过程中临时窗口的销毁不应触发退出（由导出流程结束后显式退出）。
 app.on("window-all-closed", () => {
-	app.quit();
+	if (!exporting) {
+		app.quit();
+	}
 });
