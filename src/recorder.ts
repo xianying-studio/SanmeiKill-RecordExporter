@@ -81,6 +81,24 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		let startTime = 0; // recording-start 收到时的墙钟基准（ms）
 		let frameCount = 0;
 		let timer: NodeJS.Timeout | null = null;
+		let repaintTimer: NodeJS.Timeout | null = null;
+
+		// 以采集帧率周期性强制离屏窗口整屏重绘，使每帧都把完整画面（含静止的牌桌/角色/手牌）刷进 paint 位图。
+		const startRepaintPump = () => {
+			if (repaintTimer) {
+				return;
+			}
+			const interval = Math.max(4, Math.round(1000 / Math.max(1, opts.fps)));
+			repaintTimer = setInterval(() => {
+				if (offscreen && !offscreen.isDestroyed() && capturing) {
+					try {
+						offscreen.webContents.invalidate();
+					} catch {
+						/* ignore */
+					}
+				}
+			}, interval);
+		};
 
 		// 音频事件 + 文件（录制结束时一并交给编码端离线混音）。
 		const audioEvents: AudioEvent[] = [];
@@ -103,6 +121,10 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			if (timer) {
 				clearTimeout(timer);
 				timer = null;
+			}
+			if (repaintTimer) {
+				clearInterval(repaintTimer);
+				repaintTimer = null;
 			}
 			opts.signal?.removeEventListener("abort", onAbort);
 			ipcMain.removeListener("offscreen:notify", onNotify);
@@ -156,8 +178,8 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			}
 			// 收集音频播放事件：用 recorder 统一时钟打戳（真实墙钟时间），与帧同源。
 			if (msg?.type === "audio-event") {
-				if (msg.url && startTime) {
-					const t = (Date.now() - startTime) / 1000;
+				if (msg.url && startTime > 0) {
+					const t = Math.max(0, (Date.now() - startTime) / 1000);
 					audioEvents.push({ t, url: msg.url, loop: !!msg.loop });
 					dlog("audio-event t=", t.toFixed(2), "loop=", !!msg.loop, "url=", String(msg.url).slice(-48));
 				}
@@ -173,6 +195,10 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					// 统一时钟基准：帧与音频事件都以此刻为 0。
 					startTime = Date.now();
 					opts.onStage?.("record", 0);
+					// 启动「强制全屏重绘」泵：Electron 离屏渲染默认只把「脏矩形」刷进 paint 位图，
+					// 静止时牌桌/角色/手牌区域不被重绘 → 捕获帧里只剩背景与刚变化的 UI（角色像「消失」），
+					// 唯有觉醒等全屏特效强制整屏重绘时才完整出现。周期性 invalidate() 强制每帧整屏重绘，根治该问题。
+					startRepaintPump();
 					break;
 				case "progress":
 					opts.onStage?.("record", typeof msg.percent === "number" ? msg.percent : 0);

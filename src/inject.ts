@@ -69,6 +69,8 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 		let winEl: HTMLElement | null = null;
 		let bgmDescRestored = false;
 		let origDuration: number | null = null;
+		// 最近一次 BGM（loop=true）的 url：用于对 BGM 的循环重设去重，避免离线混音叠成多条重叠循环。
+		let lastBgmUrl = "";
 
 		// 把一段音频文件的原始字节去重发往主进程（编码端离线混音用）。
 		function sendFile(url: string): void {
@@ -87,6 +89,14 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 		function emitEvent(url: string, loop: boolean): void {
 			if (!url) {
 				return;
+			}
+			if (loop) {
+				// BGM 是单条循环轨：同一 url 的重复设置（游戏在轨道边界重设 src 以续播）只记一次，
+				// 否则离线混音会为每次重设各起一条循环源，叠成多条重叠 BGM。
+				if (url === lastBgmUrl) {
+					return;
+				}
+				lastBgmUrl = url;
 			}
 			sendFile(url);
 			notify({ type: "audio-event", url, loop });
@@ -165,9 +175,24 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 				notify({ type: "debug", message: "hook BGM 失败: " + err });
 			}
 
-			// 4. 触发 BGM（回放默认不放背景音乐）。
+			// 4. 触发并捕获初始 BGM。
+			//    回放在 hook 安装前可能已设置 ui.backgroundMusic.src（BGM 已在播），此时 hook 的 setter 不会回放性地触发，
+			//    导致首条 BGM 事件要等到曲子播完、游戏在循环边界重设 src 时才被捕获（实测约 221s 后）。
+			//    因此先主动触发一次 playBackgroundMusic（其内部会设 src → 命中 hook）；若触发后 src 仍非空但未命中
+			//    （例如值与原值相同、浏览器未再次派发），再直接读取当前 src 兜底补发一次。
 			try {
-				w.game && typeof w.game.playBackgroundMusic === "function" && w.game.playBackgroundMusic();
+				const bgm = w.ui && w.ui.backgroundMusic;
+				const before = bgm ? bgm.src : "";
+				if (w.game && typeof w.game.playBackgroundMusic === "function") {
+					w.game.playBackgroundMusic();
+				}
+				// 兜底：playBackgroundMusic 走 db:/异步分支或未改变 src 时，直接读当前 src 补发（emitEvent 内已按 url 去重）。
+				const after = bgm ? bgm.src : "";
+				if (after) {
+					emitEvent(after, true);
+				} else if (before) {
+					emitEvent(before, true);
+				}
 			} catch {
 				/* ignore */
 			}
