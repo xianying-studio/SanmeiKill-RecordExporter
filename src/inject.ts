@@ -60,7 +60,9 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 			if (s.video) {
 				if (!started) {
 					started = true;
-					total = videoEvent ? Math.max(1, videoEvent.video.length) : 1;
+					if (videoEvent) {
+						total = Math.max(1, videoEvent.video.length);
+					}
 					s.videoDuration = 1;
 					try {
 						if (w.ui && w.ui.system) {
@@ -73,11 +75,12 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 				} else {
 					s.videoDuration = 1;
 					if (videoEvent) {
+						// 首次读到录像数组时锁定总步数作为分母：数组随播放只减不增，
+						// 故「首次可见的长度」即为最大值；此后不再变更 total，进度保持单调。
+						if (total === 0) {
+							total = Math.max(1, videoEvent.video.length);
+						}
 						const remaining = videoEvent.video.length;
-						// total 表示录像步骤总数（分母）：录像数组随播放被 shift 递减，
-						// 故 total 取「见过的最大长度」，以兼容「开始时尚未读到数组（total=1）」的情形，
-						// 正常情况下它即为起始的完整长度，进度因此保持单调递增。
-						total = Math.max(total, remaining);
 						const pct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
 						notify({ type: "progress", percent: pct });
 					}
