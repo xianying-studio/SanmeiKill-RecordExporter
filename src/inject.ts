@@ -56,8 +56,8 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 			}
 			// 播放开始的判定以 _status.video 为主信号：它在 game.playVideoContent 中被置为 true，
 			// 且整段播放期间保持为真，比「当前事件恰为录像根事件」更稳定（后者会因子事件入栈而频繁错过）。
-			const videoEvent = findVideoEvent(s);
 			if (s.video) {
+				const videoEvent = findVideoEvent(s);
 				// 录像数组首次可见时一次性锁定总步数作为进度分母：
 				// 数组随播放只减不增，故「首见长度」即为最大值，total 此后不再变更，进度保持单调。
 				if (total === 0 && videoEvent) {
