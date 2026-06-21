@@ -31,9 +31,11 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 	// 沿事件父链查找「录像根事件」（其 video 为待播放步骤数组）。
 	// 播放过程中 _status.event 往往是某个子事件，直接读 _status.event.video 多数时刻为 undefined，
 	// 因此用父链回溯定位录像数组，作为进度来源。
+	// MAX_EVENT_CHAIN_DEPTH 仅为防御性上限，避免异常事件链导致死循环。
+	const MAX_EVENT_CHAIN_DEPTH = 200;
 	function findVideoEvent(status: any): any {
 		let e = status && status.event;
-		for (let i = 0; e && i < 200; i++) {
+		for (let i = 0; e && i < MAX_EVENT_CHAIN_DEPTH; i++) {
 			if (Array.isArray(e.video)) {
 				return e;
 			}
@@ -72,7 +74,9 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 					s.videoDuration = 1;
 					if (videoEvent) {
 						const remaining = videoEvent.video.length;
-						// 录像数组随播放被 shift 递减；以见到过的最大长度作为分母，保证进度单调。
+						// total 表示录像步骤总数（分母）：录像数组随播放被 shift 递减，
+						// 故 total 取「见过的最大长度」，以兼容「开始时尚未读到数组（total=1）」的情形，
+						// 正常情况下它即为起始的完整长度，进度因此保持单调递增。
 						total = Math.max(total, remaining);
 						const pct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
 						notify({ type: "progress", percent: pct });
