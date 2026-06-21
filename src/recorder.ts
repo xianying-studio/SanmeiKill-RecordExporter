@@ -56,6 +56,9 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		let frameCount = 0;
 		let timer: NodeJS.Timeout | null = null;
 
+		// WebSocket 断开时的取消原因（中止录制并清理后台残留窗口）。
+		const ABORT_REASON = "已取消：WebSocket 连接已断开";
+
 		const cleanup = () => {
 			if (timer) {
 				clearTimeout(timer);
@@ -79,7 +82,7 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			reject(err);
 		};
 
-		const onAbort = () => fail(new Error("已取消：WebSocket 连接已断开"));
+		const onAbort = () => fail(new Error(ABORT_REASON));
 
 		const succeed = (buf: Buffer) => {
 			if (settled) {
@@ -154,7 +157,7 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 
 		if (opts.signal) {
 			if (opts.signal.aborted) {
-				fail(new Error("已取消：WebSocket 连接已断开"));
+				fail(new Error(ABORT_REASON));
 				return;
 			}
 			opts.signal.addEventListener("abort", onAbort);
