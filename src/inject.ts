@@ -372,8 +372,32 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 	// 预热目的：让 JIT/Service Worker 注册与资源缓存在「不录制」的这一遍完成，
 	// 使下一遍（录制阶段）的初始化命中缓存、快且稳定，便于精确控制开场遮罩停留 1 秒。
 	if (sessionStorage.getItem(WARMED)) {
+		// 预热阶段是「冷缓存」的完整加载，是整个导出里最耗时的一段。游戏 #loading-progress 进度条
+		// 在此从 0→100% 反映 SW/JIT 注册与静态资源缓存的真实进度。轮询其宽度并上报 progress-cache，
+		// 同步给导出对话框的「正在缓存资源…」，避免用户长时间面对无进度反馈的界面。
+		let lastCachePct = -1;
+		const cachePoll = setInterval(() => {
+			try {
+				const bar = document.getElementById("loading-progress");
+				if (bar) {
+					const pct = Math.max(0, Math.min(100, parseFloat(bar.style.width) || 0));
+					if (pct !== lastCachePct) {
+						lastCachePct = pct;
+						notify({ type: "progress-cache", percent: pct });
+					}
+				}
+			} catch {
+				/* ignore */
+			}
+		}, 150);
+		const stopCachePoll = () => {
+			clearInterval(cachePoll);
+			// 预热结束、即将 reload 进入录制阶段：补一帧 100%，让缓存阶段进度条收满。
+			notify({ type: "progress-cache", percent: 100 });
+		};
 		const armAndReload = () => {
 			try {
+				stopCachePoll();
 				sessionStorage.setItem(PLAY_ARMED, "1");
 				sessionStorage.removeItem(WARMED);
 				location.reload();

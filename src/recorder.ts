@@ -19,7 +19,7 @@ export interface RecordOptions {
 	speed?: number;
 	/** 码率（可选，缺省走 mediabunny 的 QUALITY_HIGH）。 */
 	bitrate?: number;
-	/** 阶段进度回调：stage 为 load/record/encode，percent 0-100。 */
+	/** 阶段进度回调：stage 为 cache/load/record/encode，percent 0-100。 */
 	onStage?: (stage: string, percent: number) => void;
 	/** 调试日志回调。 */
 	onLog?: (message: string) => void;
@@ -190,6 +190,11 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 				case "splash-done":
 					opts.onStage?.("load", 100);
 					break;
+				case "progress-cache":
+					// 预热阶段（首遍完整加载、注册 SW/JIT 并缓存静态资源）的真实加载进度，
+					// 来源为游戏 #loading-progress 进度条；映射为「正在缓存资源…」反馈给导出对话框。
+					opts.onStage?.("cache", typeof msg.percent === "number" ? msg.percent : 0);
+					break;
 				case "recording-start":
 					capturing = true;
 					// 统一时钟基准：帧与音频事件都以此刻为 0。
@@ -332,7 +337,9 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 						dlog("离屏导航:", url);
 					}
 				});
-				opts.onStage?.("load", 0);
+				// 进入离屏加载：首遍即开始缓存静态资源，初始即以 cache 阶段反馈，
+				// 与预热阶段上报的 progress-cache 衔接，避免对话框长时间停在无意义的初始态。
+				opts.onStage?.("cache", 0);
 				offscreen.webContents.on("did-finish-load", () => {
 					dlog("离屏 did-finish-load, 注入诊断+驱动脚本");
 					// 先注入诊断脚本：拦截会永久阻塞离屏渲染器的同步 alert/confirm/prompt，
