@@ -1,4 +1,4 @@
-import { BrowserWindow, ipcMain } from "electron";
+import { BrowserWindow, ipcMain, MessageChannelMain, MessagePortMain } from "electron";
 import path from "path";
 import { appUrl } from "../appProtocol";
 
@@ -17,9 +17,13 @@ export class EncoderWindow {
 	private doneResolve: ((buf: Buffer) => void) | null = null;
 	private failed: ((err: Error) => void) | null = null;
 	private rejected = false;
+	/** 帧专用通道（主进程侧端口）；帧经此 postMessage 投送到编码器主世界。 */
+	private framePort: MessagePortMain | null = null;
 
 	/** 编码进度回调（已编码帧数）。 */
 	onProgress?: (encodedFrames: number) => void;
+	/** 进入「混音 + 封装」收尾阶段的回调（此后无细粒度进度）。 */
+	onMux?: () => void;
 	/** 编码器渲染进程日志回调（调试用）。 */
 	onLog?: (message: string) => void;
 
@@ -48,6 +52,12 @@ export class EncoderWindow {
 		await this.win.loadURL(appUrl("encoder/encoder.html"));
 		void wcId;
 		await ready;
+
+		// 建立帧专用通道：把 port2 transfer 给渲染进程（preload 再转入主世界），port1 留在主进程用于投帧。
+		const { port1, port2 } = new MessageChannelMain();
+		this.framePort = port1;
+		this.win.webContents.postMessage("encoder:frame-port", null, [port2]);
+		port1.start();
 	}
 
 	private onMessage = (event: Electron.IpcMainEvent, msg: any): void => {
@@ -63,6 +73,9 @@ export class EncoderWindow {
 				break;
 			case "progress":
 				this.onProgress?.(msg.encodedFrames || 0);
+				break;
+			case "mux-start":
+				this.onMux?.();
 				break;
 			case "log":
 				this.onLog?.(String(msg.message));
@@ -93,9 +106,11 @@ export class EncoderWindow {
 		await inited;
 	}
 
-	/** 推送一帧 BGRA 画面（来自离屏窗口的 paint 事件）。 */
+	/** 推送一帧 BGRA 画面（来自离屏窗口的 paint 事件），经帧专用端口投送到编码器主世界。 */
 	pushFrame(bgra: Buffer, timestampSec: number): void {
-		this.send({ type: "frame", buffer: bgra, timestampSec });
+		if (this.framePort) {
+			this.framePort.postMessage({ bytes: bgra, timestampSec });
+		}
 	}
 
 	/**
@@ -127,6 +142,14 @@ export class EncoderWindow {
 	/** 销毁窗口并解绑监听。 */
 	close(): void {
 		ipcMain.removeListener("encoder:to-main", this.onMessage);
+		if (this.framePort) {
+			try {
+				this.framePort.close();
+			} catch {
+				/* ignore */
+			}
+			this.framePort = null;
+		}
 		if (this.win && !this.win.isDestroyed()) {
 			this.win.destroy();
 		}

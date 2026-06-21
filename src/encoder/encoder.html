@@ -6,13 +6,10 @@
 		<title>encoder</title>
 	</head>
 	<body>
-		<canvas id="frame" hidden></canvas>
 		<script type="module">
-			import { Output, Mp4OutputFormat, BufferTarget, CanvasSource, AudioBufferSource, QUALITY_HIGH } from "/vendor/mediabunny.mjs";
+			import { Output, Mp4OutputFormat, BufferTarget, VideoSampleSource, VideoSample, AudioBufferSource, QUALITY_HIGH, QUALITY_VERY_HIGH } from "/vendor/mediabunny.mjs";
 
 			const bridge = window.encoderBridge;
-			const canvas = document.getElementById("frame");
-			const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
 			// 音频混音采样率与声道数。
 			const AUDIO_SAMPLE_RATE = 48000;
@@ -21,13 +18,13 @@
 			let output = null;
 			let videoSource = null;
 			let audioSource = null;
-			let imageData = null;
 			let frameWidth = 0;
 			let frameHeight = 0;
 			let fps = 30;
+			let frameDuration = 1 / 30;
 			let encodedFrames = 0;
 
-			// 视频帧队列（尊重编码器/写入背压）。
+			// 视频帧队列（尊重编码器/写入背压）。帧经专用 MessagePort 从主进程直达本主世界。
 			const videoQueue = [];
 			let videoDraining = false;
 			let finishRequested = false;
@@ -45,18 +42,37 @@
 				frameWidth = msg.width;
 				frameHeight = msg.height;
 				fps = msg.fps || 30;
-				canvas.width = frameWidth;
-				canvas.height = frameHeight;
-				imageData = ctx.createImageData(frameWidth, frameHeight);
+				frameDuration = 1 / Math.max(1, fps);
 
 				output = new Output({
 					format: new Mp4OutputFormat({ fastStart: "in-memory" }),
 					target: new BufferTarget(),
 				});
 
-				videoSource = new CanvasSource(canvas, {
+				// 视频轨：直接编码 BGRA 原始帧（无 canvas、无逐像素 swizzle）。
+				// hardwareAcceleration:"prefer-hardware" 让 Chromium 优先用 GPU 硬件编码器（如 NVENC）；
+				// 不支持时按 WebCodecs 规范自动回退软件编码，不会抛错。
+				// latencyMode:"quality" 偏向画质而非低延迟（录像导出非实时场景）。
+				videoSource = new VideoSampleSource({
 					codec: "avc",
-					bitrate: typeof msg.bitrate === "number" ? msg.bitrate : QUALITY_HIGH,
+					bitrate: typeof msg.bitrate === "number" ? msg.bitrate : QUALITY_VERY_HIGH,
+					hardwareAcceleration: "prefer-hardware",
+					latencyMode: "quality",
+					onEncoderConfig: config => {
+						try {
+							log(
+								"VideoEncoderConfig: " +
+									JSON.stringify({
+										codec: config.codec,
+										hardwareAcceleration: config.hardwareAcceleration,
+										width: config.codedWidth || config.width,
+										height: config.codedHeight || config.height,
+										bitrate: config.bitrate,
+										latencyMode: config.latencyMode,
+									})
+							);
+						} catch {}
+					},
 				});
 				output.addVideoTrack(videoSource, { frameRate: fps });
 
@@ -68,19 +84,6 @@
 				bridge.send({ type: "inited" });
 			}
 
-			// 将 BGRA 字节填入 RGBA 的 ImageData。
-			function drawBgra(bytes) {
-				const data = imageData.data;
-				const n = data.length;
-				for (let i = 0; i < n; i += 4) {
-					data[i] = bytes[i + 2]; // R <- B
-					data[i + 1] = bytes[i + 1]; // G
-					data[i + 2] = bytes[i]; // B <- R
-					data[i + 3] = bytes[i + 3]; // A
-				}
-				ctx.putImageData(imageData, 0, 0);
-			}
-
 			async function drainVideo() {
 				if (videoDraining) return;
 				videoDraining = true;
@@ -88,10 +91,21 @@
 					while (videoQueue.length) {
 						const item = videoQueue.shift();
 						const bytes = item.bytes instanceof Uint8Array ? item.bytes : new Uint8Array(item.bytes);
-						drawBgra(bytes);
-						await videoSource.add(item.timestampSec, 1 / fps);
+						// 直接以 BGRA 原始像素构造 VideoSample → 交给硬件/软件编码器，省掉 canvas 与通道交换循环。
+						const sample = new VideoSample(bytes, {
+							format: "BGRA",
+							codedWidth: frameWidth,
+							codedHeight: frameHeight,
+							timestamp: item.timestampSec,
+							duration: frameDuration,
+						});
+						try {
+							await videoSource.add(sample);
+						} finally {
+							sample.close();
+						}
 						encodedFrames++;
-						if (encodedFrames % 15 === 0) {
+						if (encodedFrames % 10 === 0) {
 							bridge.send({ type: "progress", encodedFrames });
 						}
 					}
@@ -101,6 +115,8 @@
 					return;
 				}
 				videoDraining = false;
+				// 报一次最终帧数，便于进度收尾。
+				bridge.send({ type: "progress", encodedFrames });
 				if (finishRequested) {
 					await finalize();
 				}
@@ -159,6 +175,8 @@
 
 			async function finalize() {
 				try {
+					// 通知主进程进入「混音 + 封装」收尾阶段（无细粒度进度，UI 据此显示收尾态）。
+					bridge.send({ type: "mux-start" });
 					// 先离线混音并写入音频轨，再 finalize。
 					try {
 						const mixed = await buildMixedAudio();
@@ -176,13 +194,11 @@
 				}
 			}
 
+			// 控制通道（init / audio-data / finish）：经隔离世界 preload 的 ipc 桥转发。
 			bridge.onMessage(async msg => {
 				try {
 					if (msg.type === "init") {
 						await init(msg);
-					} else if (msg.type === "frame") {
-						videoQueue.push({ bytes: msg.buffer, timestampSec: msg.timestampSec });
-						drainVideo();
 					} else if (msg.type === "audio-data") {
 						audioData = { events: msg.events || [], files: msg.files || {}, totalDurationSec: msg.totalDurationSec || 0 };
 					} else if (msg.type === "finish") {
@@ -193,6 +209,22 @@
 					}
 				} catch (err) {
 					bridge.send({ type: "error", message: err && err.stack ? err.stack : String(err) });
+				}
+			});
+
+			// 帧通道：preload 把主进程发来的 MessagePort 通过 window.postMessage 转入主世界（端口随消息 transfer）。
+			// 帧数据（BGRA + 时间戳）经此端口直达，避免与控制/音频大消息抢同一条 ipc 通道。
+			window.addEventListener("message", ev => {
+				if (ev.data === "encoder:frame-port" && ev.ports && ev.ports[0]) {
+					const port = ev.ports[0];
+					port.onmessage = m => {
+						const d = m.data;
+						if (d && d.bytes) {
+							videoQueue.push({ bytes: d.bytes, timestampSec: d.timestampSec });
+							drainVideo();
+						}
+					};
+					port.start && port.start();
 				}
 			});
 
