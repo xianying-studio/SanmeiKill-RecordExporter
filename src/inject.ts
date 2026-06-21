@@ -11,7 +11,9 @@
  *   - 向 IndexedDB 写入录像记录（video 存储，keyPath: time）；
  *   - 向 IndexedDB 写入 config：mode=录像模式、dev=true、video_default_play_speed=1x；
  *   - 设置 localStorage[`${prefix}playback`]=time —— 触发初始化时直接 importMode 跳过开屏，
- *     并由模式自身的播放逻辑从 IndexedDB 读取录像并自动播放。
+ *     并由模式自身的播放逻辑从 IndexedDB 读取录像并自动播放；
+ *   - 设置 sessionStorage["sanmei-kill-user-started"]=true —— 跳过 reload 后的「启动!」开屏门禁，
+ *     否则离屏环境无人点击会永久卡在「正在加载游戏… 100%」。
  * 然后 reload。reload 后初始化跳过开屏、暴露全局、自动播放录像。
  *
  * 脚本每次页面加载后都会被重新注入，用 sessionStorage 哨兵区分「布置阶段」与「录制阶段」。
@@ -137,6 +139,11 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 					localStorage.setItem(configPrefix + "playbackmode", link.mode);
 					localStorage.setItem(configPrefix + "playback", String(link.time));
 					sessionStorage.setItem(PLAY_ARMED, "1");
+					// 关键：跳过 reload 后的「启动!」开屏门禁，否则离屏环境无人点击会永久卡在
+					// 「正在加载游戏… 100%」（JIT entry.ts 的 passStartGate 与 core entry.ts 均看此标记）。
+					sessionStorage.setItem("sanmei-kill-user-started", "true");
+					// 顺带跳过 JIT 首次激活 Service Worker 的额外 reload，省一次离屏重载。
+					sessionStorage.setItem("isJITReloaded", "true");
 					db.close();
 					location.reload();
 				} catch (e) {
