@@ -1,6 +1,7 @@
 import { BrowserWindow, ipcMain } from "electron";
 import path from "path";
 import { EncoderWindow } from "./encoder/encoderWindow";
+import { dlog } from "./debugLog";
 
 /** 录制参数。 */
 export interface RecordOptions {
@@ -97,6 +98,11 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			if (!offscreen || event.sender !== offscreen.webContents) {
 				return;
 			}
+			if (msg?.type === "debug") {
+				dlog("[离屏]", msg.message || "");
+				return;
+			}
+			dlog("notify <-", msg?.type, msg?.percent !== undefined ? msg.percent : "", msg?.message || "");
 			switch (msg?.type) {
 				case "splash-done":
 					opts.onStage?.("load", 100);
@@ -183,13 +189,106 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 				});
 				offscreen.webContents.setFrameRate(opts.fps);
 				offscreen.webContents.on("paint", onPaint);
-				offscreen.webContents.on("render-process-gone", (_e, details) => fail(new Error("离屏渲染进程退出：" + details.reason)));
+				offscreen.webContents.on("render-process-gone", (_e, details) => {
+					dlog("离屏渲染进程退出:", details.reason, details.exitCode);
+					fail(new Error("离屏渲染进程退出：" + details.reason));
+				});
+				offscreen.webContents.on("unresponsive", () => dlog("离屏窗口无响应(可能被同步 alert 阻塞)"));
+				offscreen.webContents.on("console-message", (_e, level, message, line, sourceId) => {
+					dlog(`[页面console l${level}] ${message} @${sourceId}:${line}`);
+				});
+				offscreen.webContents.on("did-fail-load", (_e, code, desc, url) => dlog(`[页面 did-fail-load] ${code} ${desc} ${url}`));
+				offscreen.webContents.on("did-start-navigation", (_e, url, _ih, isMain) => {
+					if (isMain) {
+						dlog("离屏导航:", url);
+					}
+				});
 				opts.onStage?.("load", 0);
 				offscreen.webContents.on("did-finish-load", () => {
-					offscreen?.webContents.executeJavaScript(opts.injectScript).catch(err => fail(err instanceof Error ? err : new Error(String(err))));
+					dlog("离屏 did-finish-load, 注入诊断+驱动脚本");
+					// 先注入诊断脚本：拦截会永久阻塞离屏渲染器的同步 alert/confirm/prompt，
+					// 捕获 window.onerror，并周期性回报 _status 关键状态用于排障。
+					offscreen?.webContents
+						.executeJavaScript(buildDiagnosticsScript())
+						.then(() => offscreen?.webContents.executeJavaScript(opts.injectScript))
+						.catch(err => fail(err instanceof Error ? err : new Error(String(err))));
 				});
 				return offscreen.loadURL(opts.url);
 			})
 			.catch(err => fail(err instanceof Error ? err : new Error(String(err))));
 	});
+}
+
+/**
+ * 离屏页诊断脚本：在游戏脚本执行前注入到主世界。
+ *
+ * 目的（均为排查「卡在 100%」类问题）：
+ * 1. 拦截 alert/confirm/prompt —— 这些同步对话在不可见离屏渲染器中会永久阻塞 JS 主线程，
+ *    表现就是「卡住不动」。改为经 __exporter.notify 上报，绝不阻塞。
+ * 2. 捕获 window.onerror / unhandledrejection，上报错误信息。
+ * 3. 每秒回报一次 _status 关键状态（是否暴露全局、是否进入播放、事件链概况），
+ *    据此判断到底卡在「全局未暴露」还是「未进入播放」还是「播放未结束」。
+ */
+function buildDiagnosticsScript(): string {
+	function body(): void {
+		const w = window as any;
+		const notify = (m: any) => {
+			try {
+				w.__exporter && w.__exporter.notify(m);
+			} catch {
+				/* ignore */
+			}
+		};
+		const report = (message: string) => notify({ type: "debug", message });
+
+		// 1. 拦截同步对话框（离屏阻塞元凶）。
+		try {
+			w.alert = (msg: any) => report("拦截 alert: " + String(msg));
+			w.confirm = (msg: any) => {
+				report("拦截 confirm: " + String(msg));
+				return true;
+			};
+			w.prompt = (msg: any) => {
+				report("拦截 prompt: " + String(msg));
+				return null;
+			};
+		} catch {
+			/* ignore */
+		}
+
+		// 2. 错误捕获。
+		w.addEventListener("error", (e: any) => {
+			report("window error: " + (e && e.message ? e.message : String(e)) + " @" + (e && e.filename) + ":" + (e && e.lineno));
+		});
+		w.addEventListener("unhandledrejection", (e: any) => {
+			let r: any = e && e.reason;
+			report("unhandledrejection: " + (r && r.message ? r.message : String(r)));
+		});
+
+		// 3. 状态心跳：每秒回报一次，便于定位卡点。
+		let ticks = 0;
+		const iv = setInterval(() => {
+			ticks++;
+			const s = w._status;
+			const info: any = {
+				t: ticks,
+				hasStatus: !!s,
+				hasGame: !!w.game,
+				hasLib: !!w.lib,
+				inSplash: !!w.inSplash,
+			};
+			if (s) {
+				info.video = !!s.video;
+				info.over = !!s.over;
+				info.paused = !!s.paused;
+				info.hasEvent = !!s.event;
+				info.eventName = s.event && s.event.name;
+			}
+			report("heartbeat " + JSON.stringify(info));
+			if (ticks >= 60) {
+				clearInterval(iv);
+			}
+		}, 1000);
+	}
+	return `(${body.toString()})();`;
 }

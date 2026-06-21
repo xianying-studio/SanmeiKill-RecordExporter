@@ -6,6 +6,7 @@ import { startWsServer, type ExporterConnection, type VideoMessage } from "./wsS
 import { registerAppScheme, handleAppScheme } from "./appProtocol";
 import { recordOffscreen } from "./recorder";
 import { buildInjectScript } from "./inject";
+import { dlog } from "./debugLog";
 
 /**
  * 三梅杀录像导出工具 —— 主进程入口。
@@ -68,6 +69,7 @@ function handleProtocolUrl(url: string | undefined | null): void {
 		return;
 	}
 	receivedProtocolUrl = true;
+	dlog("收到协议拉起, baseurl=", payload.baseurl, "listenport=", payload.listenport);
 	startExport(payload);
 }
 
@@ -150,6 +152,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 	}
 
 	// 3. 离屏加载游戏、注入驱动脚本、原速播放并逐帧编码为 MP4。
+	dlog("开始离屏录制, savePath=", savePath, "录像 payload 长度=", msg.payload.length);
 	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX);
 	try {
 		const buffer = await recordOffscreen({
@@ -159,7 +162,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 			height: RECORD_HEIGHT,
 			fps: RECORD_FPS,
 			onStage: (stage, percent) => conn.progress(stage, percent),
-			onLog: m => console.log("[record-exporter]", m),
+			onLog: m => dlog(m),
 			signal,
 		});
 		if (signal?.aborted) {
@@ -167,9 +170,11 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		}
 		// 4. 写盘并汇报完成。
 		await fs.promises.writeFile(savePath, buffer);
+		dlog("录制完成, 已写盘, 字节=", buffer.length);
 		conn.progress("encode", 100);
 		conn.done();
 	} catch (e: any) {
+		dlog("录制失败:", e && e.message ? e.message : String(e));
 		console.error("[record-exporter] 录制失败：", e);
 		conn.error("录制失败：" + (e && e.message ? e.message : String(e)));
 	}
