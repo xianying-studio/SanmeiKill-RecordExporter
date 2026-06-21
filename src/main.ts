@@ -62,14 +62,6 @@ app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 app.commandLine.appendSwitch("force-device-scale-factor", "1");
 app.commandLine.appendSwitch("high-dpi-support", "1");
 
-// 关闭硬件加速，强制离屏渲染走「软件输出设备」路径。
-// 关键修复：GPU 加速的离屏渲染会把频繁动画的元素（玩家/卡牌）提升为独立 GPU 合成层，
-// 而软件读回的 paint 位图抓不到这些层 —— 表现为「只有背景/UI/对话框，没有角色和手牌」
-// （仅当觉醒动画遮罩等覆盖其上、把它们逼回软件合成面时才透出来）。
-// 软件输出设备会把所有层都画进位图，从根本上解决该问题；据 Electron 文档软件 OSR 反而更快。
-// 代价：放弃 WebCodecs 硬件编码（本机 H.264 硬件编码本就探测不可用，无实际损失）。
-app.disableHardwareAcceleration();
-
 // 注册 app:// 协议（必须在 app ready 之前声明），用于编码器窗口加载本地资源与 mediabunny。
 registerAppScheme();
 
