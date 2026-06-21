@@ -14,15 +14,13 @@
 			const canvas = document.getElementById("frame");
 			const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
-			// 固定音频参数（与 inject.ts 的 AUDIO_SAMPLE_RATE 和采集声道数一致）。
+			// 音频混音采样率与声道数。
 			const AUDIO_SAMPLE_RATE = 48000;
 			const AUDIO_CHANNELS = 2;
 
 			let output = null;
 			let videoSource = null;
 			let audioSource = null;
-			// 用于构造 AudioBuffer（不接设备，仅利用 createBuffer API）。
-			let audioCtx = null;
 			let imageData = null;
 			let frameWidth = 0;
 			let frameHeight = 0;
@@ -32,14 +30,10 @@
 			// 视频帧队列（尊重编码器/写入背压）。
 			const videoQueue = [];
 			let videoDraining = false;
-
-			// 音频块队列（在 output.start() 前到达的块先缓冲，init 后 drain）。
-			const audioQueue = [];
-			let audioDraining = false;
-			let outputStarted = false;
-
-			// 是否已请求 finalize（双队列均 drain 完才真正 finalize）。
 			let finishRequested = false;
+
+			// 录制结束时一次性收到的音频事件 + 文件，用于离线混音。
+			let audioData = null; // { events, files, totalDurationSec }
 
 			function log(msg) {
 				try {
@@ -66,19 +60,12 @@
 				});
 				output.addVideoTrack(videoSource, { frameRate: fps });
 
-				// 加音频轨：AAC，固定 48kHz 双声道。
+				// 音频轨：AAC，固定 48kHz 双声道。后续在 finish 时离线混音填充。
 				audioSource = new AudioBufferSource({ codec: "aac", bitrate: QUALITY_HIGH });
 				output.addAudioTrack(audioSource);
 
-				// AudioContext 仅用于构造 AudioBuffer，不接设备。
-				audioCtx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
-
 				await output.start();
-				outputStarted = true;
 				bridge.send({ type: "inited" });
-
-				// drain 在 output.start() 前已积压的音频块。
-				drainAudio();
 			}
 
 			// 将 BGRA 字节填入 RGBA 的 ImageData。
@@ -114,37 +101,73 @@
 					return;
 				}
 				videoDraining = false;
-				tryFinalize();
+				if (finishRequested) {
+					await finalize();
+				}
 			}
 
-			async function drainAudio() {
-				if (!outputStarted || audioDraining) return;
-				audioDraining = true;
-				try {
-					while (audioQueue.length) {
-						const item = audioQueue.shift();
-						const buf = audioCtx.createBuffer(AUDIO_CHANNELS, item.frames, AUDIO_SAMPLE_RATE);
-						buf.copyToChannel(item.ch0, 0);
-						buf.copyToChannel(item.ch1, 1);
-						await audioSource.add(buf);
+			/**
+			 * 离线混音：把所有「在某视频时间点播放某音频文件」的事件，
+			 * 用 OfflineAudioContext 渲染成一条整段 AudioBuffer，再喂给 mediabunny 音频轨。
+			 * 音量保持默认（不缩放）。BGM（loop=true）循环至视频结束。
+			 */
+			async function buildMixedAudio() {
+				if (!audioData || !audioData.events || audioData.events.length === 0) {
+					return null;
+				}
+				const totalDur = Math.max(0.1, audioData.totalDurationSec || 0);
+				const totalFrames = Math.ceil(totalDur * AUDIO_SAMPLE_RATE);
+
+				// 解码所有用到的文件（URL → AudioBuffer），用普通 AudioContext.decodeAudioData。
+				const decodeCtx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+				const decoded = {};
+				const urls = Object.keys(audioData.files || {});
+				for (const url of urls) {
+					try {
+						const bytes = audioData.files[url];
+						const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+						decoded[url] = await decodeCtx.decodeAudioData(ab);
+					} catch (err) {
+						log("decode 失败 " + url + ": " + (err && err.message ? err.message : err));
 					}
-				} catch (err) {
-					log("audio drain error: " + (err && err.stack ? err.stack : String(err)));
-					// 音频编码失败不终止整体；继续清空队列避免内存泄漏。
-					audioQueue.length = 0;
 				}
-				audioDraining = false;
-				tryFinalize();
-			}
+				await decodeCtx.close();
 
-			function tryFinalize() {
-				if (finishRequested && !videoDraining && !audioDraining && videoQueue.length === 0 && audioQueue.length === 0) {
-					finalize();
+				const offline = new OfflineAudioContext(AUDIO_CHANNELS, totalFrames, AUDIO_SAMPLE_RATE);
+				for (const ev of audioData.events) {
+					const buf = decoded[ev.url];
+					if (!buf) continue;
+					if (ev.t >= totalDur) continue;
+					const src = offline.createBufferSource();
+					src.buffer = buf;
+					if (ev.loop) {
+						src.loop = true;
+						src.loopStart = 0;
+						src.loopEnd = buf.duration;
+					}
+					src.connect(offline.destination);
+					const startAt = Math.max(0, ev.t);
+					src.start(startAt);
+					// 循环音轨（BGM）在视频结束处停止。
+					if (ev.loop) {
+						src.stop(totalDur);
+					}
 				}
+				const rendered = await offline.startRendering();
+				return rendered;
 			}
 
 			async function finalize() {
 				try {
+					// 先离线混音并写入音频轨，再 finalize。
+					try {
+						const mixed = await buildMixedAudio();
+						if (mixed) {
+							await audioSource.add(mixed);
+						}
+					} catch (err) {
+						log("音频混音失败（将输出无声视频）: " + (err && err.stack ? err.stack : String(err)));
+					}
 					await output.finalize();
 					const buffer = output.target.buffer;
 					bridge.send({ type: "done", buffer, encodedFrames }, [buffer]);
@@ -160,14 +183,12 @@
 					} else if (msg.type === "frame") {
 						videoQueue.push({ bytes: msg.buffer, timestampSec: msg.timestampSec });
 						drainVideo();
-					} else if (msg.type === "audio") {
-						audioQueue.push({ ch0: msg.ch0, ch1: msg.ch1, frames: msg.frames });
-						drainAudio();
+					} else if (msg.type === "audio-data") {
+						audioData = { events: msg.events || [], files: msg.files || {}, totalDurationSec: msg.totalDurationSec || 0 };
 					} else if (msg.type === "finish") {
 						finishRequested = true;
-						// 两个队列都 drain 完才 finalize（tryFinalize 在各 drain 结尾触发）。
 						if (!videoDraining && videoQueue.length === 0) {
-							drainAudio().then(() => tryFinalize());
+							await finalize();
 						}
 					}
 				} catch (err) {

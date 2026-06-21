@@ -98,9 +98,14 @@ export class EncoderWindow {
 		this.send({ type: "frame", buffer: bgra, timestampSec });
 	}
 
-	/** 推送一块 PCM 音频（来自离屏窗口的 Web Audio 采集）。 */
-	pushAudio(ch0: Float32Array, ch1: Float32Array, frames: number): void {
-		this.send({ type: "audio", ch0, ch1, frames });
+	/**
+	 * 传入音频事件与文件，供编码端在 finish 时离线混音为一条 AAC 轨。
+	 * @param events 播放事件（含视频时间戳、URL、是否循环）
+	 * @param files URL → 原始音频字节
+	 * @param totalDurationSec 视频总时长（音频不超过此长度）
+	 */
+	setAudio(events: Array<{ t: number; url: string; loop: boolean }>, files: Record<string, Uint8Array>, totalDurationSec: number): void {
+		this.send({ type: "audio-data", events, files, totalDurationSec });
 	}
 
 	/** 通知编码结束，等待并返回最终 MP4 字节。 */

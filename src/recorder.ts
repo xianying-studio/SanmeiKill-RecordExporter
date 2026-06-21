@@ -13,8 +13,10 @@ export interface RecordOptions {
 	width: number;
 	/** 录制画面高。 */
 	height: number;
-	/** 采样帧率。 */
+	/** 采样帧率（离屏 paint 的 setFrameRate；倍速下应尽量高，Electron offscreen 上限 240）。 */
 	fps: number;
+	/** 录制倍速：游戏以此倍速回放，帧/音频时间戳 ×speed 还原为正常速度。默认 1。 */
+	speed?: number;
 	/** 码率（可选，缺省走 mediabunny 的 QUALITY_HIGH）。 */
 	bitrate?: number;
 	/** 阶段进度回调：stage 为 load/record/encode，percent 0-100。 */
@@ -32,9 +34,19 @@ interface NotifyMessage {
 	type: string;
 	percent?: number;
 	message?: string;
-	ch0?: Float32Array;
-	ch1?: Float32Array;
-	frames?: number;
+	url?: string;
+	loop?: boolean;
+	data?: Uint8Array;
+}
+
+/** 一条音频播放事件（视频时间戳由 recorder 端统一时钟打戳）。 */
+interface AudioEvent {
+	/** 视频时间（秒，已 ×speed 还原）。 */
+	t: number;
+	/** 音频文件 URL（与 audioFiles 的 key 对应）。 */
+	url: string;
+	/** 是否循环（BGM 为 true）。 */
+	loop: boolean;
 }
 
 /** WebSocket 断开时的取消原因（中止录制并清理后台残留窗口）。 */
@@ -43,13 +55,15 @@ const ABORT_REASON = "已取消：WebSocket 连接已断开";
 /**
  * 离屏加载页面、注入驱动脚本播放录像、按墙钟时间戳逐帧编码为 MP4。
  *
- * 帧来源为离屏窗口的 paint 事件（NativeImage / BGRA）。时间戳采用墙钟相对时间，
- * 因此无论 paint 实际节奏如何，最终视频时长都与「原速播放」的真实时长一致。
+ * 帧来源为离屏窗口的 paint 事件（NativeImage / BGRA）。时间戳采用「墙钟相对时间 × speed」：
+ * 游戏以 speed 倍速回放（真实耗时缩短为 1/speed），帧时间戳 ×speed 后还原为正常速度的视频。
+ * 音频不实时采集 PCM（倍速会变调），而是收集「播放事件 + 文件」，由编码端离线混音定位到正确时间。
  *
  * @returns 编码完成的 MP4 字节
  */
 export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 	return new Promise<Buffer>((resolve, reject) => {
+		const speed = opts.speed && opts.speed >= 1 ? opts.speed : 1;
 		const encoder = new EncoderWindow();
 		encoder.onProgress = frames => opts.onLog?.(`encoded ${frames} frames`);
 		encoder.onLog = m => opts.onLog?.("[encoder] " + m);
@@ -59,9 +73,14 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		let capturing = false;
 		let inited = false;
 		let initing = false;
-		let startTime = 0;
+		let startTime = 0; // recording-start 收到时的墙钟基准（ms）
 		let frameCount = 0;
 		let timer: NodeJS.Timeout | null = null;
+
+		// 音频事件 + 文件（录制结束时一并交给编码端离线混音）。
+		const audioEvents: AudioEvent[] = [];
+		const audioFiles: Record<string, Uint8Array> = {};
+		let lastVideoTs = 0; // 最近一帧的视频时间戳，作为音频总时长上界
 
 		const cleanup = () => {
 			if (timer) {
@@ -105,9 +124,18 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 				dlog("[离屏]", msg.message || "");
 				return;
 			}
-			if (msg?.type === "audio") {
-				if (msg.ch0 && msg.ch1 && msg.frames) {
-					encoder.pushAudio(msg.ch0, msg.ch1, msg.frames);
+			// 收集音频文件原始字节（按 URL 去重，离屏端已去重，这里再兜底）。
+			if (msg?.type === "audio-file") {
+				if (msg.url && msg.data) {
+					audioFiles[msg.url] = msg.data;
+				}
+				return;
+			}
+			// 收集音频播放事件：用 recorder 统一时钟打戳（× speed 还原视频时间），与帧同源。
+			if (msg?.type === "audio-event") {
+				if (msg.url && startTime) {
+					const t = ((Date.now() - startTime) / 1000) * speed;
+					audioEvents.push({ t, url: msg.url, loop: !!msg.loop });
 				}
 				return;
 			}
@@ -118,6 +146,8 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					break;
 				case "recording-start":
 					capturing = true;
+					// 统一时钟基准：帧与音频事件都以此刻为 0。
+					startTime = Date.now();
 					opts.onStage?.("record", 0);
 					break;
 				case "progress":
@@ -135,6 +165,33 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 
 		const finishEncoding = () => {
 			opts.onStage?.("encode", 0);
+			// 先补齐仅有 URL（HTTP）但离屏端未送来字节的音频文件，再做离线混音。
+			void prepareAudioAndFinish();
+		};
+
+		// 拉取所有事件引用但尚无字节的音频文件（HTTP 同源由离屏 fetch；此处兜底拉取漏网的）。
+		const prepareAudioAndFinish = async () => {
+			try {
+				const needed = new Set<string>();
+				for (const ev of audioEvents) {
+					if (!audioFiles[ev.url]) {
+						needed.add(ev.url);
+					}
+				}
+				for (const url of needed) {
+					try {
+						const res = await fetch(url);
+						const ab = await res.arrayBuffer();
+						audioFiles[url] = new Uint8Array(ab);
+					} catch (e) {
+						dlog("主进程拉取音频失败:", url, String(e));
+					}
+				}
+				// 总时长用最后一帧时间戳（音频不应超过视频长度）。
+				encoder.setAudio(audioEvents, audioFiles, lastVideoTs);
+			} catch (e) {
+				dlog("准备音频失败:", String(e));
+			}
 			encoder
 				.finish()
 				.then(buf => succeed(buf))
@@ -154,7 +211,6 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					return;
 				}
 				initing = true;
-				startTime = Date.now();
 				encoder
 					.init(size.width, size.height, opts.fps, opts.bitrate)
 					.then(() => {
@@ -163,7 +219,9 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					.catch(err => fail(err instanceof Error ? err : new Error(String(err))));
 				return;
 			}
-			const ts = (Date.now() - startTime) / 1000;
+			// 时间戳：墙钟相对 recording-start × speed，还原为正常速度的视频时间。
+			const ts = ((Date.now() - startTime) / 1000) * speed;
+			lastVideoTs = ts;
 			encoder.pushFrame(image.getBitmap(), ts);
 			frameCount++;
 		};

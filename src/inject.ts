@@ -18,9 +18,11 @@
  *
  * 脚本每次页面加载后都会被重新注入，用 sessionStorage 哨兵区分「布置阶段」与「录制阶段」。
  */
-function injectBody(linkJson: string, dbName: string, configPrefix: string): void {
+function injectBody(linkJson: string, dbName: string, configPrefix: string, speed: number): void {
 	const w = window as any;
 	const PLAY_ARMED = "exporter_play_armed";
+	// 录制倍速：游戏以 speed 倍速回放，最终视频时间戳由 recorder 端 ×speed 还原为正常速度。
+	const SPEED = speed >= 1 ? speed : 1;
 
 	function notify(m: any): void {
 		try {
@@ -46,85 +48,74 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 		return null;
 	}
 
-	/** 采集音频用的固定采样率（与编码器侧一致，AAC 友好）。 */
-	const AUDIO_SAMPLE_RATE = 48000;
-
 	/**
-	 * 启动音频采集：把游戏所有 <audio> 的输出汇入一个 AudioContext，
-	 * 经 ScriptProcessor 取出 PCM 上报给主进程（再由编码器窗口编成 AAC 轨）。
+	 * 启动音频「事件」采集与倍速控制。
 	 *
-	 * 关键点：
-	 * - 游戏不使用 Web Audio，所有声音都是挂在 ui.window 下的 <audio> 元素
-	 *   （BGM 为单例 ui.backgroundMusic，音效为每次新建、播完即删）。
-	 * - 把每个 <audio> 经 createMediaElementSource 接到采集图后，该元素就只走我们的图、
-	 *   不再走默认输出，从而天然不外放（叠加离屏 setAudioMuted 双保险）。
-	 * - 采集节点不把输入回写到输出（输出写静音），故设备端无声。
-	 * - 回放默认不自动放 BGM，这里手动触发一次 game.playBackgroundMusic()。
+	 * 不再实时采集 PCM（倍速回放下 PCM 会变调不可用），改为记录「在什么时间点播放了哪个音频文件」：
+	 * - 游戏所有声音都是挂在 ui.window 下的 <audio> 元素（音效每次新建，BGM 为单例 ui.backgroundMusic）。
+	 * - hook ui.window.appendChild 捕获音效元素的 src；hook ui.backgroundMusic.src setter 捕获 BGM。
+	 * - 播放发生时立即发 audio-event（不带时间戳，由 recorder 端用统一时钟打戳，× SPEED 还原视频时间）。
+	 * - 每个唯一 URL 只 fetch 一次原始二进制（含 blob:，在同源离屏窗口里可取）发 audio-file，编码端据此离线混音。
+	 * - 倍速：_status.videoDuration = 1/SPEED 缩短回放等待；并缩短 CSS transition 时长以同步加速动画。
+	 * - 触发一次 game.playBackgroundMusic()（回放默认不放 BGM）。
 	 *
-	 * @returns 停止采集的清理函数
+	 * @returns 停止采集/还原 hook 的清理函数
 	 */
 	function startAudioCapture(): () => void {
-		let ac: AudioContext | null = null;
-		let processor: ScriptProcessorNode | null = null;
-		const connected: WeakSet<HTMLMediaElement> = new WeakSet();
+		const sentFiles: Set<string> = new Set();
 		let origAppendChild: ((node: any) => any) | null = null;
 		let winEl: HTMLElement | null = null;
+		let bgmDescRestored = false;
+		let restoreCssPatch: (() => void) | null = null;
+
+		// 把一段音频文件的原始字节去重发往主进程（编码端离线混音用）。
+		function sendFile(url: string): void {
+			if (!url || sentFiles.has(url)) {
+				return;
+			}
+			sentFiles.add(url);
+			// 同源 / blob: 均可在离屏窗口内 fetch；拿到 ArrayBuffer 经 __exporter 通道上报。
+			fetch(url)
+				.then(r => r.arrayBuffer())
+				.then(buf => notify({ type: "audio-file", url, data: new Uint8Array(buf) }))
+				.catch(err => notify({ type: "debug", message: "fetch 音频失败 " + url + ": " + err }));
+		}
+
+		// 记录一次播放事件（recorder 端按收到时刻打时间戳）。
+		function emitEvent(url: string, loop: boolean): void {
+			if (!url) {
+				return;
+			}
+			sendFile(url);
+			notify({ type: "audio-event", url, loop });
+		}
 
 		try {
-			const AC = w.AudioContext || w.webkitAudioContext;
-			if (!AC) {
-				notify({ type: "debug", message: "无 AudioContext，跳过音频采集" });
-				return () => void 0;
+			// 1. 倍速：缩短回放等待与 CSS 动画。
+			try {
+				if (w._status) {
+					w._status.videoDuration = 1 / SPEED;
+				}
+			} catch {
+				/* ignore */
 			}
-			ac = new AC({ sampleRate: AUDIO_SAMPLE_RATE });
-			if (ac && ac.state === "suspended") {
-				ac.resume().catch(() => void 0);
-			}
+			restoreCssPatch = patchCssTransitionSpeed(SPEED);
 
-			// 采集节点：2 入 2 出；输出写静音以避免外放。
-			processor = ac!.createScriptProcessor(4096, 2, 2);
-			processor.onaudioprocess = (e: AudioProcessingEvent) => {
-				const inBuf = e.inputBuffer;
-				const out = e.outputBuffer;
-				const frames = inBuf.length;
-				const inL = inBuf.numberOfChannels > 0 ? inBuf.getChannelData(0) : new Float32Array(frames);
-				const inR = inBuf.numberOfChannels > 1 ? inBuf.getChannelData(1) : inL;
-				// 复制后上报（底层缓冲会被复用，不能直接传引用）。
-				const ch0 = new Float32Array(inL);
-				const ch1 = new Float32Array(inR);
-				notify({ type: "audio", ch0, ch1, frames });
-				// 输出静音。
-				for (let c = 0; c < out.numberOfChannels; c++) {
-					out.getChannelData(c).fill(0);
-				}
-			};
-			processor.connect(ac!.destination);
-
-			const connectEl = (el: HTMLMediaElement) => {
-				if (!ac || !processor || connected.has(el)) {
-					return;
-				}
-				try {
-					const src = ac.createMediaElementSource(el);
-					src.connect(processor); // 不连 ac.destination，故不外放
-					connected.add(el);
-				} catch (err) {
-					// 某元素已被接入别的图等异常：忽略，避免影响录制。
-					notify({ type: "debug", message: "connect <audio> 失败: " + err });
-				}
-			};
-
+			// 2. 接管音效 <audio>：hook appendChild。
 			winEl = (w.ui && w.ui.window) || document.body;
-			// 接管已存在的 <audio>（含 BGM 单例）。
 			if (winEl) {
-				winEl.querySelectorAll("audio").forEach((el: HTMLMediaElement) => connectEl(el));
-				// patch appendChild，覆盖后续动态创建的音效元素。
+				// 已存在的音效元素（一般为空，BGM 单独处理）。
+				winEl.querySelectorAll("audio").forEach((el: any) => {
+					if (el !== (w.ui && w.ui.backgroundMusic) && el.src) {
+						emitEvent(el.src, false);
+					}
+				});
 				origAppendChild = winEl.appendChild.bind(winEl);
 				winEl.appendChild = function (node: any) {
 					const ret = origAppendChild!(node);
 					try {
-						if (node && node.tagName === "AUDIO") {
-							connectEl(node as HTMLMediaElement);
+						if (node && node.tagName === "AUDIO" && node !== (w.ui && w.ui.backgroundMusic) && node.src) {
+							emitEvent(node.src, false);
 						}
 					} catch {
 						/* ignore */
@@ -133,16 +124,48 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 				} as typeof winEl.appendChild;
 			}
 
-			// 触发 BGM（回放默认不放背景音乐）。
+			// 3. 接管 BGM：hook ui.backgroundMusic.src setter（BGM 循环，loop=true）。
+			try {
+				const bgm = w.ui && w.ui.backgroundMusic;
+				if (bgm) {
+					const proto = Object.getPrototypeOf(bgm);
+					const desc = Object.getOwnPropertyDescriptor(proto, "src") || Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "src");
+					if (desc && desc.set && desc.get) {
+						const origSet = desc.set;
+						const origGet = desc.get;
+						Object.defineProperty(bgm, "src", {
+							configurable: true,
+							get() {
+								return origGet.call(this);
+							},
+							set(v: string) {
+								origSet.call(this, v);
+								try {
+									if (v) {
+										emitEvent(this.src || v, true);
+									}
+								} catch {
+									/* ignore */
+								}
+							},
+						});
+						bgmDescRestored = true;
+					}
+				}
+			} catch (err) {
+				notify({ type: "debug", message: "hook BGM 失败: " + err });
+			}
+
+			// 4. 触发 BGM（回放默认不放背景音乐）。
 			try {
 				w.game && typeof w.game.playBackgroundMusic === "function" && w.game.playBackgroundMusic();
 			} catch {
 				/* ignore */
 			}
 
-			notify({ type: "debug", message: "音频采集已启动" });
+			notify({ type: "debug", message: "音频事件采集已启动, SPEED=" + SPEED });
 		} catch (err) {
-			notify({ type: "debug", message: "启动音频采集失败: " + err });
+			notify({ type: "debug", message: "启动音频事件采集失败: " + err });
 		}
 
 		return () => {
@@ -154,15 +177,71 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 				/* ignore */
 			}
 			try {
-				processor && processor.disconnect();
+				if (bgmDescRestored) {
+					const bgm = w.ui && w.ui.backgroundMusic;
+					if (bgm) {
+						delete bgm.src; // 删除实例级覆盖，回落到原型 setter
+					}
+				}
 			} catch {
 				/* ignore */
 			}
 			try {
-				ac && ac.close();
+				restoreCssPatch && restoreCssPatch();
 			} catch {
 				/* ignore */
 			}
+		};
+	}
+
+	/**
+	 * 缩短 CSS transition 时长以配合倍速：monkey-patch CSSStyleDeclaration 的
+	 * transition / transitionDuration setter，把其中的时间值除以 SPEED。
+	 * 游戏的动画全部通过内联样式设置（如 node.style.transition = "all 0.5s"），
+	 * 内联样式优先级最高，只有改 setter 才能生效。
+	 * @returns 还原 patch 的函数
+	 */
+	function patchCssTransitionSpeed(factor: number): () => void {
+		if (factor <= 1) {
+			return () => void 0;
+		}
+		const proto = (w.CSSStyleDeclaration && w.CSSStyleDeclaration.prototype) as any;
+		if (!proto) {
+			return () => void 0;
+		}
+		// 把字符串里所有 "<num>s" / "<num>ms" 时间值除以 factor。
+		const scale = (value: string): string =>
+			String(value).replace(/([\d.]+)(ms|s)\b/g, (_m, num, unit) => {
+				const n = parseFloat(num) / factor;
+				return n + unit;
+			});
+		const patched: Array<[string, PropertyDescriptor]> = [];
+		["transition", "transitionDuration", "animation", "animationDuration"].forEach(prop => {
+			const desc = Object.getOwnPropertyDescriptor(proto, prop);
+			if (desc && desc.set && desc.get) {
+				const origSet = desc.set;
+				patched.push([prop, desc]);
+				Object.defineProperty(proto, prop, {
+					configurable: true,
+					get: desc.get,
+					set(v: string) {
+						try {
+							origSet.call(this, scale(v));
+						} catch {
+							origSet.call(this, v);
+						}
+					},
+				});
+			}
+		});
+		return () => {
+			patched.forEach(([prop, desc]) => {
+				try {
+					Object.defineProperty(proto, prop, desc);
+				} catch {
+					/* ignore */
+				}
+			});
 		};
 	}
 
@@ -188,7 +267,7 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 				}
 				if (!started) {
 					started = true;
-					s.videoDuration = 1;
+					s.videoDuration = 1 / SPEED;
 					try {
 						if (w.ui && w.ui.system) {
 							w.ui.system.style.display = "none";
@@ -196,11 +275,11 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 					} catch {
 						/* ignore */
 					}
-					// 启动音频采集并触发 BGM（回放默认不放背景音乐）。
+					// 启动音频事件采集 + 倍速 + 触发 BGM。
 					stopAudio = startAudioCapture();
 					notify({ type: "recording-start" });
 				} else {
-					s.videoDuration = 1;
+					s.videoDuration = 1 / SPEED;
 					if (videoEvent && total > 0) {
 						const remaining = videoEvent.video.length;
 						const pct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
@@ -334,7 +413,8 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
  * @param linkJson 录像记录的 JSON 字符串（由 base64 payload 解码而来）
  * @param dbName 游戏 IndexedDB 数据库名（如 noname_0.9_data）
  * @param configPrefix 游戏配置前缀（如 noname_0.9_）
+ * @param speed 录制倍速（游戏以此倍速回放，recorder 端 ×speed 还原为正常速度）
  */
-export function buildInjectScript(linkJson: string, dbName: string, configPrefix: string): string {
-	return `(${injectBody.toString()})(${JSON.stringify(linkJson)}, ${JSON.stringify(dbName)}, ${JSON.stringify(configPrefix)});`;
+export function buildInjectScript(linkJson: string, dbName: string, configPrefix: string, speed: number): string {
+	return `(${injectBody.toString()})(${JSON.stringify(linkJson)}, ${JSON.stringify(dbName)}, ${JSON.stringify(configPrefix)}, ${JSON.stringify(speed)});`;
 }

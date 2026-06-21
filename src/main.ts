@@ -27,10 +27,17 @@ let receivedProtocolUrl = false;
 /** 是否正在导出（录制中临时窗口关闭不应触发整体退出）。 */
 let exporting = false;
 
-/** 录制画面尺寸与帧率（离屏窗口逻辑尺寸）。 */
+/** 录制画面尺寸（离屏窗口逻辑尺寸）。 */
 const RECORD_WIDTH = 1280;
 const RECORD_HEIGHT = 720;
-const RECORD_FPS = 30;
+
+/**
+ * 录制倍速：游戏以此倍速回放以缩短录制耗时；帧/音频时间戳 ×SPEED 还原为正常速度。
+ * 离屏 paint 采样帧率设为高值（Electron offscreen 上限 240）；最终视频有效帧率 ≈ CAPTURE_FPS/SPEED。
+ * SPEED=8 + CAPTURE_FPS=240 → 输出 ≈30fps，录制耗时约 1/8。
+ */
+const SPEED_FACTOR = 8;
+const CAPTURE_FPS = 240;
 
 /** 游戏 IndexedDB 数据库名与配置前缀（configprefix 固定为 noname_0.9_）。 */
 const GAME_DB_NAME = "noname_0.9_data";
@@ -156,16 +163,17 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		return;
 	}
 
-	// 3. 离屏加载游戏、注入驱动脚本、原速播放并逐帧编码为 MP4。
-	dlog("开始离屏录制, savePath=", savePath, "录像 payload 长度=", msg.payload.length);
-	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX);
+	// 3. 离屏加载游戏、注入驱动脚本、倍速回放并逐帧编码为 MP4。
+	dlog("开始离屏录制, savePath=", savePath, "录像 payload 长度=", msg.payload.length, "倍速=", SPEED_FACTOR);
+	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, SPEED_FACTOR);
 	try {
 		const buffer = await recordOffscreen({
 			url: payload.baseurl,
 			injectScript,
 			width: RECORD_WIDTH,
 			height: RECORD_HEIGHT,
-			fps: RECORD_FPS,
+			fps: CAPTURE_FPS,
+			speed: SPEED_FACTOR,
 			onStage: (stage, percent) => conn.progress(stage, percent),
 			onLog: m => dlog(m),
 			signal,
