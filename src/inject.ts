@@ -28,6 +28,20 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 		}
 	}
 
+	// 沿事件父链查找「录像根事件」（其 video 为待播放步骤数组）。
+	// 播放过程中 _status.event 往往是某个子事件，直接读 _status.event.video 多数时刻为 undefined，
+	// 因此用父链回溯定位录像数组，作为进度来源。
+	function findVideoEvent(status: any): any {
+		let e = status && status.event;
+		for (let i = 0; e && i < 200; i++) {
+			if (Array.isArray(e.video)) {
+				return e;
+			}
+			e = e.parent;
+		}
+		return null;
+	}
+
 	// —— 录制阶段：已布置并 reload，等待播放开始→采集进度→结束 ——
 	if (sessionStorage.getItem(PLAY_ARMED)) {
 		let started = false;
@@ -38,10 +52,13 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 			if (!s) {
 				return;
 			}
-			if (s.video && s.event && Array.isArray(s.event.video)) {
+			// 播放开始的判定以 _status.video 为主信号：它在 game.playVideoContent 中被置为 true，
+			// 且整段播放期间保持为真，比「当前事件恰为录像根事件」更稳定（后者会因子事件入栈而频繁错过）。
+			const videoEvent = findVideoEvent(s);
+			if (s.video) {
 				if (!started) {
 					started = true;
-					total = Math.max(1, s.event.video.length);
+					total = videoEvent ? Math.max(1, videoEvent.video.length) : 1;
 					s.videoDuration = 1;
 					try {
 						if (w.ui && w.ui.system) {
@@ -53,9 +70,13 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 					notify({ type: "recording-start" });
 				} else {
 					s.videoDuration = 1;
-					const remaining = s.event.video.length;
-					const pct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
-					notify({ type: "progress", percent: pct });
+					if (videoEvent) {
+						const remaining = videoEvent.video.length;
+						// 录像数组随播放被 shift 递减；以见到过的最大长度作为分母，保证进度单调。
+						total = Math.max(total, remaining);
+						const pct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
+						notify({ type: "progress", percent: pct });
+					}
 				}
 			}
 			if (started && s.over) {
