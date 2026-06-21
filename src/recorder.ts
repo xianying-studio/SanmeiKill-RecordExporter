@@ -443,6 +443,11 @@ function buildDiagnosticsScript(): string {
 						transform: cs.transform,
 						willChange: cs.willChange,
 						zIndex: cs.zIndex,
+						// 定位 opacity:0 来源：内联 style 还是 class。
+						inlineStyle: p0.getAttribute("style") || "",
+						className: p0.className,
+						inlineOpacity: p0.style.opacity,
+						transition: cs.transition,
 					};
 				}
 			} catch (err) {
