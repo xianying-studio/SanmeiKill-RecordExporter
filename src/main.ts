@@ -32,12 +32,13 @@ const RECORD_WIDTH = 1280;
 const RECORD_HEIGHT = 720;
 
 /**
- * 录制倍速：游戏以此倍速回放以缩短录制耗时；帧/音频时间戳 ×SPEED 还原为正常速度。
- * 离屏 paint 采样帧率设为高值（Electron offscreen 上限 240）；最终视频有效帧率 ≈ CAPTURE_FPS/SPEED。
- * SPEED=8 + CAPTURE_FPS=240 → 输出 ≈30fps，录制耗时约 1/8。
+ * 等待压缩系数：回放时只压缩各类「等待」（步间空隙 + 录像 delay 步 + videoContent 内部 game.delay），
+ * 动画时长保持自然速度，时间戳按真实墙钟（不做 ×倍数还原）。
+ * 效果：动画正常、无慢动作、无黑屏拉伸；导出比实时快约 WAIT_COMPRESS 倍（省掉大量空等）。
+ * 取值偏大时，被压缩的等待可能短于动画时长而轻微截断动画——3 为兼顾速度与观感的稳妥默认值。
  */
-const SPEED_FACTOR = 8;
-const CAPTURE_FPS = 240;
+const WAIT_COMPRESS = 3;
+const CAPTURE_FPS = 60;
 
 /** 游戏 IndexedDB 数据库名与配置前缀（configprefix 固定为 noname_0.9_）。 */
 const GAME_DB_NAME = "noname_0.9_data";
@@ -163,9 +164,9 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		return;
 	}
 
-	// 3. 离屏加载游戏、注入驱动脚本、倍速回放并逐帧编码为 MP4。
-	dlog("开始离屏录制, savePath=", savePath, "录像 payload 长度=", msg.payload.length, "倍速=", SPEED_FACTOR);
-	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, SPEED_FACTOR);
+	// 3. 离屏加载游戏、注入驱动脚本、压缩等待回放并逐帧编码为 MP4。
+	dlog("开始离屏录制, savePath=", savePath, "录像 payload 长度=", msg.payload.length, "等待压缩=", WAIT_COMPRESS);
+	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, WAIT_COMPRESS);
 	try {
 		const buffer = await recordOffscreen({
 			url: payload.baseurl,
@@ -173,7 +174,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 			width: RECORD_WIDTH,
 			height: RECORD_HEIGHT,
 			fps: CAPTURE_FPS,
-			speed: SPEED_FACTOR,
+			speed: WAIT_COMPRESS,
 			onStage: (stage, percent) => conn.progress(stage, percent),
 			onLog: m => dlog(m),
 			signal,

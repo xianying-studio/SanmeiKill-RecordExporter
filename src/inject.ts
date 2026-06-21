@@ -21,7 +21,8 @@
 function injectBody(linkJson: string, dbName: string, configPrefix: string, speed: number): void {
 	const w = window as any;
 	const PLAY_ARMED = "exporter_play_armed";
-	// 录制倍速：游戏以 speed 倍速回放，最终视频时间戳由 recorder 端 ×speed 还原为正常速度。
+	// 「等待压缩」系数：仅压缩回放中的各类「等待」（步间空隙 + 录像 delay 步 + videoContent 内部 game.delay），
+	// 动画时长（写死在样式表里）保持自然速度。时间戳按真实墙钟，不做 ×倍数还原，故无慢动作。
 	const SPEED = speed >= 1 ? speed : 1;
 
 	function notify(m: any): void {
@@ -56,7 +57,8 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 	 * - hook ui.window.appendChild 捕获音效元素的 src；hook ui.backgroundMusic.src setter 捕获 BGM。
 	 * - 播放发生时立即发 audio-event（不带时间戳，由 recorder 端用统一时钟打戳，× SPEED 还原视频时间）。
 	 * - 每个唯一 URL 只 fetch 一次原始二进制（含 blob:，在同源离屏窗口里可取）发 audio-file，编码端据此离线混音。
-	 * - 倍速：_status.videoDuration = 1/SPEED 缩短回放等待；并缩短 CSS transition 时长以同步加速动画。
+	 * - 压缩等待：_status.videoDuration=1/SPEED（步间空隙 content.js:4564）+ lib.config.duration/=SPEED
+	 *   （录像内 delay 步 content.js:4534 与 videoContent 内部 game.delay：time*duration）；动画时长保持自然速度。
 	 * - 触发一次 game.playBackgroundMusic()（回放默认不放 BGM）。
 	 *
 	 * @returns 停止采集/还原 hook 的清理函数
@@ -66,7 +68,7 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 		let origAppendChild: ((node: any) => any) | null = null;
 		let winEl: HTMLElement | null = null;
 		let bgmDescRestored = false;
-		let restoreCssPatch: (() => void) | null = null;
+		let origDuration: number | null = null;
 
 		// 把一段音频文件的原始字节去重发往主进程（编码端离线混音用）。
 		function sendFile(url: string): void {
@@ -91,15 +93,22 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 		}
 
 		try {
-			// 1. 倍速：缩短回放等待与 CSS 动画。
+			// 1. 压缩等待（不动画）：
+			//    - videoDuration 控制步间空隙（content.js:4564 走 time2 路径，仅受 videoDuration 影响）；
+			//    - lib.config.duration 控制录像内 delay 步与 videoContent 内部 game.delay（game.delay: time*duration）。
+			//    两者同除以 SPEED → 所有「等待」整体加速 SPEED 倍；动画时长（样式表固定）保持自然速度。
 			try {
 				if (w._status) {
 					w._status.videoDuration = 1 / SPEED;
 				}
+				if (w.lib && w.lib.config && typeof w.lib.config.duration === "number") {
+					const d = w.lib.config.duration as number;
+					origDuration = d;
+					w.lib.config.duration = d / SPEED;
+				}
 			} catch {
 				/* ignore */
 			}
-			restoreCssPatch = patchCssTransitionSpeed(SPEED);
 
 			// 2. 接管音效 <audio>：hook appendChild。
 			winEl = (w.ui && w.ui.window) || document.body;
@@ -187,61 +196,12 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 				/* ignore */
 			}
 			try {
-				restoreCssPatch && restoreCssPatch();
+				if (origDuration !== null && w.lib && w.lib.config) {
+					w.lib.config.duration = origDuration;
+				}
 			} catch {
 				/* ignore */
 			}
-		};
-	}
-
-	/**
-	 * 缩短 CSS transition 时长以配合倍速：monkey-patch CSSStyleDeclaration 的
-	 * transition / transitionDuration setter，把其中的时间值除以 SPEED。
-	 * 游戏的动画全部通过内联样式设置（如 node.style.transition = "all 0.5s"），
-	 * 内联样式优先级最高，只有改 setter 才能生效。
-	 * @returns 还原 patch 的函数
-	 */
-	function patchCssTransitionSpeed(factor: number): () => void {
-		if (factor <= 1) {
-			return () => void 0;
-		}
-		const proto = (w.CSSStyleDeclaration && w.CSSStyleDeclaration.prototype) as any;
-		if (!proto) {
-			return () => void 0;
-		}
-		// 把字符串里所有 "<num>s" / "<num>ms" 时间值除以 factor。
-		const scale = (value: string): string =>
-			String(value).replace(/([\d.]+)(ms|s)\b/g, (_m, num, unit) => {
-				const n = parseFloat(num) / factor;
-				return n + unit;
-			});
-		const patched: Array<[string, PropertyDescriptor]> = [];
-		["transition", "transitionDuration", "animation", "animationDuration"].forEach(prop => {
-			const desc = Object.getOwnPropertyDescriptor(proto, prop);
-			if (desc && desc.set && desc.get) {
-				const origSet = desc.set;
-				patched.push([prop, desc]);
-				Object.defineProperty(proto, prop, {
-					configurable: true,
-					get: desc.get,
-					set(v: string) {
-						try {
-							origSet.call(this, scale(v));
-						} catch {
-							origSet.call(this, v);
-						}
-					},
-				});
-			}
-		});
-		return () => {
-			patched.forEach(([prop, desc]) => {
-				try {
-					Object.defineProperty(proto, prop, desc);
-				} catch {
-					/* ignore */
-				}
-			});
 		};
 	}
 
