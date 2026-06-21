@@ -81,54 +81,90 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 		return;
 	}
 
-	try {
-		const req = indexedDB.open(dbName, 4);
-		// 注入脚本在游戏 boot 之前运行：若数据库尚未由游戏创建，open 会得到一个空库。
-		// 必须与游戏一致地建好对象存储，否则后续事务会抛 NotFoundError（object store not found）。
-		req.onupgradeneeded = () => {
-			const db = req.result;
-			if (!db.objectStoreNames.contains("video")) {
-				db.createObjectStore("video", { keyPath: "time" });
+	// 写入事务必须用到的对象存储；缺一不可，否则 transaction 抛 NotFoundError。
+	const REQUIRED_STORES = ["video", "config"];
+	// 与游戏一致的完整对象存储集合，补建时一并建好以免后续游戏逻辑缺存储。
+	const ALL_STORES = ["video", "image", "audio", "config", "data"];
+
+	function ensureStores(db: IDBDatabase): void {
+		for (const name of ALL_STORES) {
+			if (!db.objectStoreNames.contains(name)) {
+				if (name === "video") {
+					db.createObjectStore("video", { keyPath: "time" });
+				} else {
+					db.createObjectStore(name);
+				}
 			}
-			if (!db.objectStoreNames.contains("image")) {
-				db.createObjectStore("image");
-			}
-			if (!db.objectStoreNames.contains("audio")) {
-				db.createObjectStore("audio");
-			}
-			if (!db.objectStoreNames.contains("config")) {
-				db.createObjectStore("config");
-			}
-			if (!db.objectStoreNames.contains("data")) {
-				db.createObjectStore("data");
-			}
-		};
-		req.onsuccess = () => {
-			const db = req.result;
-			try {
-				const tx = db.transaction(["video", "config"], "readwrite");
-				const videoStore = tx.objectStore("video");
-				const configStore = tx.objectStore("config");
-				videoStore.put(link);
-				configStore.put(link.mode, "mode");
-				configStore.put(true, "dev");
-				configStore.put("1x", "video_default_play_speed");
-				tx.oncomplete = () => {
+		}
+	}
+
+	function writeAndReload(db: IDBDatabase): void {
+		try {
+			const tx = db.transaction(["video", "config"], "readwrite");
+			const videoStore = tx.objectStore("video");
+			const configStore = tx.objectStore("config");
+			videoStore.put(link);
+			configStore.put(link.mode, "mode");
+			configStore.put(true, "dev");
+			configStore.put("1x", "video_default_play_speed");
+			tx.oncomplete = () => {
+				try {
+					localStorage.setItem(configPrefix + "playbackmode", link.mode);
+					localStorage.setItem(configPrefix + "playback", String(link.time));
+					sessionStorage.setItem(PLAY_ARMED, "1");
+					db.close();
+					location.reload();
+				} catch (e) {
+					notify({ type: "error", message: "设置播放标记失败：" + e });
 					try {
-						localStorage.setItem(configPrefix + "playbackmode", link.mode);
-						localStorage.setItem(configPrefix + "playback", String(link.time));
-						sessionStorage.setItem(PLAY_ARMED, "1");
-						location.reload();
-					} catch (e) {
-						notify({ type: "error", message: "设置播放标记失败：" + e });
+						db.close();
+					} catch {
+						/* ignore */
 					}
-				};
-				tx.onerror = () => notify({ type: "error", message: "写入录像/配置失败" });
-			} catch (e) {
-				notify({ type: "error", message: "IndexedDB 事务失败：" + e });
+				}
+			};
+			tx.onerror = () => {
+				try {
+					db.close();
+				} catch {
+					/* ignore */
+				}
+				notify({ type: "error", message: "写入录像/配置失败" });
+			};
+		} catch (e) {
+			try {
+				db.close();
+			} catch {
+				/* ignore */
 			}
+			notify({ type: "error", message: "IndexedDB 事务失败：" + e });
+		}
+	}
+
+	try {
+		// 不指定版本号打开，先读取游戏库的真实当前版本。
+		// 硬编码版本号是不可靠的：若游戏库版本更高会触发 VersionError；
+		// 若版本相同却缺少对象存储则 onupgradeneeded 不触发，事务抛 NotFoundError。
+		const probe = indexedDB.open(dbName);
+		probe.onupgradeneeded = () => ensureStores(probe.result);
+		probe.onsuccess = () => {
+			const db = probe.result;
+			const needUpgrade = REQUIRED_STORES.some(name => !db.objectStoreNames.contains(name));
+			if (!needUpgrade) {
+				writeAndReload(db);
+				return;
+			}
+			// 缺少必要对象存储：以「当前版本 + 1」重新打开并补建，
+			// 这样无论游戏库当前处于哪个版本都能安全升级。
+			const nextVersion = db.version + 1;
+			db.close();
+			const upgrade = indexedDB.open(dbName, nextVersion);
+			upgrade.onupgradeneeded = () => ensureStores(upgrade.result);
+			upgrade.onsuccess = () => writeAndReload(upgrade.result);
+			upgrade.onblocked = () => notify({ type: "error", message: "游戏数据库被占用，升级被阻塞" });
+			upgrade.onerror = () => notify({ type: "error", message: "升级游戏数据库失败：" + (upgrade.error || "") });
 		};
-		req.onerror = () => notify({ type: "error", message: "打开游戏数据库失败" });
+		probe.onerror = () => notify({ type: "error", message: "打开游戏数据库失败" });
 	} catch (e) {
 		notify({ type: "error", message: "IndexedDB 不可用：" + e });
 	}
