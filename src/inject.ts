@@ -28,6 +28,22 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 		}
 	}
 
+	// 沿事件父链查找「录像根事件」（其 video 为待播放步骤数组）。
+	// 播放过程中 _status.event 往往是某个子事件，直接读 _status.event.video 多数时刻为 undefined，
+	// 因此用父链回溯定位录像数组，作为进度来源。
+	// MAX_EVENT_CHAIN_DEPTH 仅为防御性上限：正常事件链远浅于此，200 足以覆盖且能避免异常链导致死循环。
+	const MAX_EVENT_CHAIN_DEPTH = 200;
+	function findVideoEvent(status: any): any {
+		let e = status && status.event;
+		for (let i = 0; e && i < MAX_EVENT_CHAIN_DEPTH; i++) {
+			if (Array.isArray(e.video)) {
+				return e;
+			}
+			e = e.parent;
+		}
+		return null;
+	}
+
 	// —— 录制阶段：已布置并 reload，等待播放开始→采集进度→结束 ——
 	if (sessionStorage.getItem(PLAY_ARMED)) {
 		let started = false;
@@ -38,10 +54,17 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 			if (!s) {
 				return;
 			}
-			if (s.video && s.event && Array.isArray(s.event.video)) {
+			// 播放开始的判定以 _status.video 为主信号：它在 game.playVideoContent 中被置为 true，
+			// 且整段播放期间保持为真，比「当前事件恰为录像根事件」更稳定（后者会因子事件入栈而频繁错过）。
+			if (s.video) {
+				const videoEvent = findVideoEvent(s);
+				// 录像数组首次可见时一次性锁定总步数作为进度分母：
+				// 数组随播放只减不增，故「首见长度」即为最大值，total 此后不再变更，进度保持单调。
+				if (total === 0 && videoEvent) {
+					total = Math.max(1, videoEvent.video.length);
+				}
 				if (!started) {
 					started = true;
-					total = Math.max(1, s.event.video.length);
 					s.videoDuration = 1;
 					try {
 						if (w.ui && w.ui.system) {
@@ -53,9 +76,11 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 					notify({ type: "recording-start" });
 				} else {
 					s.videoDuration = 1;
-					const remaining = s.event.video.length;
-					const pct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
-					notify({ type: "progress", percent: pct });
+					if (videoEvent && total > 0) {
+						const remaining = videoEvent.video.length;
+						const pct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
+						notify({ type: "progress", percent: pct });
+					}
 				}
 			}
 			if (started && s.over) {
