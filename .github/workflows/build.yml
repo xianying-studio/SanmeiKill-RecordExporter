@@ -61,6 +61,8 @@ jobs:
   release:
     name: 发布 Release（runId 作为版本）
     needs: build
+    # develop 分支仅构建产物，不创建 Release
+    if: github.ref != 'refs/heads/develop'
     runs-on: ubuntu-latest
     permissions:
       contents: write
