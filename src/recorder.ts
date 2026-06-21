@@ -448,6 +448,21 @@ function buildDiagnosticsScript(): string {
 						className: p0.className,
 						inlineOpacity: p0.style.opacity,
 						transition: cs.transition,
+						animationName: cs.animationName,
+						animationPlayState: cs.animationPlayState,
+						timelineTime: (document.timeline && document.timeline.currentTime) || null,
+						animations: (() => {
+							try {
+								return (p0 as any).getAnimations().map((a: any) => ({
+									name: (a.animationName as string) || "",
+									playState: a.playState,
+									currentTime: a.currentTime,
+									startTime: a.startTime,
+								}));
+							} catch (e) {
+								return [{ err: String(e) }];
+							}
+						})(),
 					};
 				}
 			} catch (err) {
