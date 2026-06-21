@@ -254,15 +254,24 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 					started = true;
 					s.videoDuration = 1 / SPEED;
 					try {
-						if (w.ui && w.ui.system) {
-							w.ui.system.style.display = "none";
+						// 用 !important 的 CSS 规则隐藏顶部回放控制条（#system：选项/返回/重播/暂停/原速/减速/加速）。
+						// 不用 ui.system.style.display='none'：回放初始化(content.js:4513-4515)会把它设回 display:'' 并 show()，
+						// 单次内联设置会被盖回；注入的 !important 规则优先级最高，引擎再 show() 也无法覆盖。
+						if (!document.getElementById("exporter-hide-ui-style")) {
+							const st = document.createElement("style");
+							st.id = "exporter-hide-ui-style";
+							st.textContent = "#system{display:none !important;}";
+							(document.head || document.documentElement).appendChild(st);
 						}
 					} catch {
 						/* ignore */
 					}
-					// 启动音频事件采集 + 倍速 + 触发 BGM。
-					stopAudio = startAudioCapture();
+					// 先发 recording-start（让 recorder 端确立统一时钟基准 startTime），再启动音频采集，
+					// 否则 startAudioCapture 内补发的「初始 BGM」事件会早于 recording-start 到达，
+					// 此时 recorder 的 startTime 仍为 0 而被丢弃 —— 这正是 BGM 始终从开头缺失的根因。
 					notify({ type: "recording-start" });
+					// 启动音频事件采集 + 触发并补发初始 BGM。
+					stopAudio = startAudioCapture();
 				} else {
 					s.videoDuration = 1 / SPEED;
 					if (videoEvent && total > 0) {

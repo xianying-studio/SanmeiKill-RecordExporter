@@ -28,16 +28,15 @@ let receivedProtocolUrl = false;
 let exporting = false;
 
 /** 录制画面尺寸（离屏窗口逻辑尺寸）。 */
-const RECORD_WIDTH = 1280;
-const RECORD_HEIGHT = 720;
+const RECORD_WIDTH = 1920;
+const RECORD_HEIGHT = 1080;
 
 /**
- * 等待压缩系数：回放时只压缩各类「等待」（步间空隙 + 录像 delay 步 + videoContent 内部 game.delay），
- * 动画时长保持自然速度，时间戳按真实墙钟（不做 ×倍数还原）。
- * 效果：动画正常、无慢动作、无黑屏拉伸；导出比实时快约 WAIT_COMPRESS 倍（省掉大量空等）。
- * 取值偏大时，被压缩的等待可能短于动画时长而轻微截断动画——3 为兼顾速度与观感的稳妥默认值。
+ * 等待压缩系数：=1 表示原速录制（不压缩任何等待，观感与实际游戏一致）。
+ * 历史上曾尝试 >1 压缩各类「等待」以加快导出，但实测加速后观感不佳（动画与节奏割裂），故改回原速。
+ * 保留该参数与链路：若将来需要再次提速，调大此值即可（注入脚本据此压缩 videoDuration 与 lib.config.duration）。
  */
-const WAIT_COMPRESS = 3;
+const WAIT_COMPRESS = 1;
 const CAPTURE_FPS = 60;
 
 /** 游戏 IndexedDB 数据库名与配置前缀（configprefix 固定为 noname_0.9_）。 */
