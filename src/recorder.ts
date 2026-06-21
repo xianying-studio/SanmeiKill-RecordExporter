@@ -159,6 +159,7 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 				if (msg.url && startTime) {
 					const t = (Date.now() - startTime) / 1000;
 					audioEvents.push({ t, url: msg.url, loop: !!msg.loop });
+					dlog("audio-event t=", t.toFixed(2), "loop=", !!msg.loop, "url=", String(msg.url).slice(-48));
 				}
 				return;
 			}
