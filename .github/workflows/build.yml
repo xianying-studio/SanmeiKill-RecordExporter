@@ -2,7 +2,7 @@ name: 构建与发布
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, develop]
   workflow_dispatch:
 
 permissions:
