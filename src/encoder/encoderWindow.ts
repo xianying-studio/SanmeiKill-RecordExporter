@@ -24,6 +24,8 @@ export class EncoderWindow {
 	onProgress?: (encodedFrames: number) => void;
 	/** 进入「混音 + 封装」收尾阶段的回调（此后无细粒度进度）。 */
 	onMux?: () => void;
+	/** 编码器渲染进程在任意阶段报错的回调（保证录制中途的错误也能上报、不被吞掉）。 */
+	onError?: (err: Error) => void;
 	/** 编码器渲染进程日志回调（调试用）。 */
 	onLog?: (message: string) => void;
 
@@ -83,9 +85,13 @@ export class EncoderWindow {
 			case "done":
 				this.doneResolve?.(Buffer.from(msg.buffer));
 				break;
-			case "error":
-				this.reject(new Error(String(msg.message || "编码器错误")));
+			case "error": {
+				const err = new Error(String(msg.message || "编码器错误"));
+				// 既上报给整体取消（onError，保证录制中途的错误也能结束流程），也兼容 open/finish 阶段的 reject。
+				this.onError?.(err);
+				this.reject(err);
 				break;
+			}
 		}
 	};
 

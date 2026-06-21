@@ -56,6 +56,12 @@ if (!gotTheLock) {
 // 注意：离屏窗口仍设 setAudioMuted(true)，故放开自动播放不会导致主机外放。
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
+// 强制设备像素缩放为 1：离屏 paint 的 image.getBitmap() 返回的是「物理像素」，而 image.getSize()
+// 返回「逻辑像素」。若系统显示缩放 >100%，两者不一致会导致按逻辑尺寸构造的 VideoSample 字节数不符而抛错。
+// 录制为后台无界面场景，固定 1:1 既消除该不一致，也避免以更高分辨率渲染、降低开销。
+app.commandLine.appendSwitch("force-device-scale-factor", "1");
+app.commandLine.appendSwitch("high-dpi-support", "1");
+
 // 注册 app:// 协议（必须在 app ready 之前声明），用于编码器窗口加载本地资源与 mediabunny。
 registerAppScheme();
 

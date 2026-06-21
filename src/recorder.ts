@@ -124,6 +124,12 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 
 		const onAbort = () => fail(new Error(ABORT_REASON));
 
+		// 编码器任意阶段报错（含录制中途）：记录并结束流程，避免被吞掉导致静默卡死。
+		encoder.onError = err => {
+			dlog("编码器报错:", err && err.message ? err.message : String(err));
+			fail(err instanceof Error ? err : new Error(String(err)));
+		};
+
 		const succeed = (buf: Buffer) => {
 			if (settled) {
 				return;
@@ -188,24 +194,31 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		};
 
 		// 拉取所有事件引用但尚无字节的音频文件（HTTP 同源由离屏 fetch；此处兜底拉取漏网的）。
+		// 注意：blob: URL 仅在渲染进程作用域内有效，主进程无法 fetch，必须跳过；
+		// 且每个 fetch 加超时，避免任一请求挂起拖死整个收尾流程（历史卡死点）。
 		const prepareAudioAndFinish = async () => {
 			try {
 				const needed = new Set<string>();
 				for (const ev of audioEvents) {
-					if (!audioFiles[ev.url]) {
+					if (!audioFiles[ev.url] && !ev.url.startsWith("blob:")) {
 						needed.add(ev.url);
 					}
 				}
+				dlog("收尾：待补拉音频文件数=", needed.size, "已有=", Object.keys(audioFiles).length, "事件数=", audioEvents.length);
 				for (const url of needed) {
 					try {
-						const res = await fetch(url);
+						const ctrl = new AbortController();
+						const to = setTimeout(() => ctrl.abort(), 5000);
+						const res = await fetch(url, { signal: ctrl.signal });
 						const ab = await res.arrayBuffer();
+						clearTimeout(to);
 						audioFiles[url] = new Uint8Array(ab);
 					} catch (e) {
-						dlog("主进程拉取音频失败:", url, String(e));
+						dlog("主进程拉取音频失败(跳过):", url, String(e));
 					}
 				}
 				// 总时长用最后一帧时间戳（音频不应超过视频长度）。
+				dlog("收尾：交付音频给编码器并 finish，视频时长=", lastVideoTs.toFixed(2), "s，总帧=", frameCount);
 				encoder.setAudio(audioEvents, audioFiles, lastVideoTs);
 			} catch (e) {
 				dlog("准备音频失败:", String(e));

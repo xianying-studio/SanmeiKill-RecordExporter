@@ -23,6 +23,8 @@
 			let fps = 30;
 			let frameDuration = 1 / 30;
 			let encodedFrames = 0;
+			let firstFrameLogged = false;
+			let sizeWarned = false;
 
 			// 视频帧队列（尊重编码器/写入背压）。帧经专用 MessagePort 从主进程直达本主世界。
 			const videoQueue = [];
@@ -81,6 +83,7 @@
 				output.addAudioTrack(audioSource);
 
 				await output.start();
+				log("inited " + frameWidth + "x" + frameHeight + " fps=" + fps);
 				bridge.send({ type: "inited" });
 			}
 
@@ -91,6 +94,19 @@
 					while (videoQueue.length) {
 						const item = videoQueue.shift();
 						const bytes = item.bytes instanceof Uint8Array ? item.bytes : new Uint8Array(item.bytes);
+						const expected = frameWidth * frameHeight * 4;
+						if (bytes.byteLength !== expected) {
+							// 字节数与 codedWidth*codedHeight*4 不符（多为设备像素缩放）：跳过该帧并告警，避免 VideoSample 抛错。
+							if (!sizeWarned) {
+								sizeWarned = true;
+								log("帧字节数不符: got " + bytes.byteLength + ", expected " + expected + " (" + frameWidth + "x" + frameHeight + ")，已跳过此类帧");
+							}
+							continue;
+						}
+						if (!firstFrameLogged) {
+							firstFrameLogged = true;
+							log("首帧到达并开始编码");
+						}
 						// 直接以 BGRA 原始像素构造 VideoSample → 交给硬件/软件编码器，省掉 canvas 与通道交换循环。
 						const sample = new VideoSample(bytes, {
 							format: "BGRA",
@@ -176,6 +192,7 @@
 			async function finalize() {
 				try {
 					// 通知主进程进入「混音 + 封装」收尾阶段（无细粒度进度，UI 据此显示收尾态）。
+					log("finalize 开始, 已编码帧=" + encodedFrames);
 					bridge.send({ type: "mux-start" });
 					// 先离线混音并写入音频轨，再 finalize。
 					try {
@@ -188,6 +205,7 @@
 					}
 					await output.finalize();
 					const buffer = output.target.buffer;
+					log("finalize 完成, 字节=" + (buffer && buffer.byteLength));
 					bridge.send({ type: "done", buffer, encodedFrames }, [buffer]);
 				} catch (err) {
 					bridge.send({ type: "error", message: err && err.stack ? err.stack : String(err) });
@@ -203,6 +221,7 @@
 						audioData = { events: msg.events || [], files: msg.files || {}, totalDurationSec: msg.totalDurationSec || 0 };
 					} else if (msg.type === "finish") {
 						finishRequested = true;
+						log("收到 finish, 待编码队列=" + videoQueue.length + " draining=" + videoDraining + " 已编码=" + encodedFrames);
 						if (!videoDraining && videoQueue.length === 0) {
 							await finalize();
 						}
