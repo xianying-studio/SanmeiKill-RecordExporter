@@ -40,6 +40,35 @@
 				} catch {}
 			}
 
+			/**
+			 * 探测可用的 H.264 硬件编码 codec string。
+			 * WebCodecs 在 Windows 上经 Media Foundation 走 NVENC，但具体 profile/level 是否暴露取决于驱动：
+			 * 失败的 avc1.64001f(High@3.1) 不代表无硬件，换 High@4.0 等往往命中。这里逐个用 prefer-hardware 探测，
+			 * 返回首个被支持的 codec string；全不支持则返回 null（调用方回退 no-preference 软件编码）。
+			 */
+			async function probeHwCodec(bitrateNum) {
+				if (typeof VideoEncoder === "undefined" || !VideoEncoder.isConfigSupported) {
+					return null;
+				}
+				const candidates = ["avc1.640028", "avc1.640020", "avc1.64001f", "avc1.4d4028", "avc1.42e028"];
+				for (const cs of candidates) {
+					try {
+						const r = await VideoEncoder.isConfigSupported({
+							codec: cs,
+							width: frameWidth,
+							height: frameHeight,
+							bitrate: bitrateNum,
+							framerate: fps,
+							hardwareAcceleration: "prefer-hardware",
+						});
+						if (r && r.supported) {
+							return cs;
+						}
+					} catch {}
+				}
+				return null;
+			}
+
 			async function init(msg) {
 				frameWidth = msg.width;
 				frameHeight = msg.height;
@@ -52,13 +81,10 @@
 				});
 
 				// 视频轨：直接编码 BGRA 原始帧（无 canvas、无逐像素 swizzle）。
-				// hardwareAcceleration:"prefer-hardware" 让 Chromium 优先用 GPU 硬件编码器（如 NVENC）；
-				// 不支持时按 WebCodecs 规范自动回退软件编码，不会抛错。
-				// latencyMode:"quality" 偏向画质而非低延迟（录像导出非实时场景）。
-				videoSource = new VideoSampleSource({
+				const bitrate = typeof msg.bitrate === "number" ? msg.bitrate : QUALITY_VERY_HIGH;
+				const videoConfig = {
 					codec: "avc",
-					bitrate: typeof msg.bitrate === "number" ? msg.bitrate : QUALITY_VERY_HIGH,
-					hardwareAcceleration: "prefer-hardware",
+					bitrate,
 					latencyMode: "quality",
 					onEncoderConfig: config => {
 						try {
@@ -75,7 +101,18 @@
 							);
 						} catch {}
 					},
-				});
+				};
+				// 探测硬件编码：命中则用 prefer-hardware + 该 codec string(NVENC)，否则 no-preference(软件，且不抛错)。
+				const hwCodec = await probeHwCodec(5000000);
+				if (hwCodec) {
+					videoConfig.hardwareAcceleration = "prefer-hardware";
+					videoConfig.fullCodecString = hwCodec;
+					log("硬件 H.264 编码可用，使用 " + hwCodec + " (prefer-hardware)");
+				} else {
+					videoConfig.hardwareAcceleration = "no-preference";
+					log("无可用 H.264 硬件编码，回退软件编码 (no-preference)");
+				}
+				videoSource = new VideoSampleSource(videoConfig);
 				output.addVideoTrack(videoSource, { frameRate: fps });
 
 				// 音频轨：AAC，固定 48kHz 双声道。后续在 finish 时离线混音填充。
