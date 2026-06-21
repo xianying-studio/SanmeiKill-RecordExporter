@@ -43,6 +43,11 @@ if (!gotTheLock) {
 	app.quit();
 }
 
+// 放开自动播放策略：离屏录制无用户手势，否则游戏的 <audio>.play() 与音频采集
+// AudioContext 会被 Chromium 自动播放策略阻塞，导致录制出的视频无声。
+// 注意：离屏窗口仍设 setAudioMuted(true)，故放开自动播放不会导致主机外放。
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
 // 注册 app:// 协议（必须在 app ready 之前声明），用于编码器窗口加载本地资源与 mediabunny。
 registerAppScheme();
 
@@ -136,7 +141,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		filters: [{ name: "MP4 视频", extensions: ["mp4"] }],
 	});
 	if (result.canceled || !result.filePath) {
-		conn.error("已取消保存");
+		conn.error("保存已被取消");
 		return;
 	}
 	const savePath = result.filePath;

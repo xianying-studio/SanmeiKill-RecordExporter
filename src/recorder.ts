@@ -32,6 +32,9 @@ interface NotifyMessage {
 	type: string;
 	percent?: number;
 	message?: string;
+	ch0?: Float32Array;
+	ch1?: Float32Array;
+	frames?: number;
 }
 
 /** WebSocket 断开时的取消原因（中止录制并清理后台残留窗口）。 */
@@ -100,6 +103,12 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			}
 			if (msg?.type === "debug") {
 				dlog("[离屏]", msg.message || "");
+				return;
+			}
+			if (msg?.type === "audio") {
+				if (msg.ch0 && msg.ch1 && msg.frames) {
+					encoder.pushAudio(msg.ch0, msg.ch1, msg.frames);
+				}
 				return;
 			}
 			dlog("notify <-", msg?.type, msg?.percent !== undefined ? msg.percent : "", msg?.message || "");
@@ -188,6 +197,9 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					},
 				});
 				offscreen.webContents.setFrameRate(opts.fps);
+				// 静音离屏窗口：录制为纯画面，游戏 BGM/音效不应外放打扰用户。
+				// setAudioMuted 仅静音本 webContents，不影响系统其他声音，也不影响截帧。
+				offscreen.webContents.setAudioMuted(true);
 				offscreen.webContents.on("paint", onPaint);
 				offscreen.webContents.on("render-process-gone", (_e, details) => {
 					dlog("离屏渲染进程退出:", details.reason, details.exitCode);

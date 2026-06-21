@@ -46,10 +46,131 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 		return null;
 	}
 
+	/** 采集音频用的固定采样率（与编码器侧一致，AAC 友好）。 */
+	const AUDIO_SAMPLE_RATE = 48000;
+
+	/**
+	 * 启动音频采集：把游戏所有 <audio> 的输出汇入一个 AudioContext，
+	 * 经 ScriptProcessor 取出 PCM 上报给主进程（再由编码器窗口编成 AAC 轨）。
+	 *
+	 * 关键点：
+	 * - 游戏不使用 Web Audio，所有声音都是挂在 ui.window 下的 <audio> 元素
+	 *   （BGM 为单例 ui.backgroundMusic，音效为每次新建、播完即删）。
+	 * - 把每个 <audio> 经 createMediaElementSource 接到采集图后，该元素就只走我们的图、
+	 *   不再走默认输出，从而天然不外放（叠加离屏 setAudioMuted 双保险）。
+	 * - 采集节点不把输入回写到输出（输出写静音），故设备端无声。
+	 * - 回放默认不自动放 BGM，这里手动触发一次 game.playBackgroundMusic()。
+	 *
+	 * @returns 停止采集的清理函数
+	 */
+	function startAudioCapture(): () => void {
+		let ac: AudioContext | null = null;
+		let processor: ScriptProcessorNode | null = null;
+		const connected: WeakSet<HTMLMediaElement> = new WeakSet();
+		let origAppendChild: ((node: any) => any) | null = null;
+		let winEl: HTMLElement | null = null;
+
+		try {
+			const AC = w.AudioContext || w.webkitAudioContext;
+			if (!AC) {
+				notify({ type: "debug", message: "无 AudioContext，跳过音频采集" });
+				return () => void 0;
+			}
+			ac = new AC({ sampleRate: AUDIO_SAMPLE_RATE });
+			if (ac && ac.state === "suspended") {
+				ac.resume().catch(() => void 0);
+			}
+
+			// 采集节点：2 入 2 出；输出写静音以避免外放。
+			processor = ac!.createScriptProcessor(4096, 2, 2);
+			processor.onaudioprocess = (e: AudioProcessingEvent) => {
+				const inBuf = e.inputBuffer;
+				const out = e.outputBuffer;
+				const frames = inBuf.length;
+				const inL = inBuf.numberOfChannels > 0 ? inBuf.getChannelData(0) : new Float32Array(frames);
+				const inR = inBuf.numberOfChannels > 1 ? inBuf.getChannelData(1) : inL;
+				// 复制后上报（底层缓冲会被复用，不能直接传引用）。
+				const ch0 = new Float32Array(inL);
+				const ch1 = new Float32Array(inR);
+				notify({ type: "audio", ch0, ch1, frames });
+				// 输出静音。
+				for (let c = 0; c < out.numberOfChannels; c++) {
+					out.getChannelData(c).fill(0);
+				}
+			};
+			processor.connect(ac!.destination);
+
+			const connectEl = (el: HTMLMediaElement) => {
+				if (!ac || !processor || connected.has(el)) {
+					return;
+				}
+				try {
+					const src = ac.createMediaElementSource(el);
+					src.connect(processor); // 不连 ac.destination，故不外放
+					connected.add(el);
+				} catch (err) {
+					// 某元素已被接入别的图等异常：忽略，避免影响录制。
+					notify({ type: "debug", message: "connect <audio> 失败: " + err });
+				}
+			};
+
+			winEl = (w.ui && w.ui.window) || document.body;
+			// 接管已存在的 <audio>（含 BGM 单例）。
+			if (winEl) {
+				winEl.querySelectorAll("audio").forEach((el: HTMLMediaElement) => connectEl(el));
+				// patch appendChild，覆盖后续动态创建的音效元素。
+				origAppendChild = winEl.appendChild.bind(winEl);
+				winEl.appendChild = function (node: any) {
+					const ret = origAppendChild!(node);
+					try {
+						if (node && node.tagName === "AUDIO") {
+							connectEl(node as HTMLMediaElement);
+						}
+					} catch {
+						/* ignore */
+					}
+					return ret;
+				} as typeof winEl.appendChild;
+			}
+
+			// 触发 BGM（回放默认不放背景音乐）。
+			try {
+				w.game && typeof w.game.playBackgroundMusic === "function" && w.game.playBackgroundMusic();
+			} catch {
+				/* ignore */
+			}
+
+			notify({ type: "debug", message: "音频采集已启动" });
+		} catch (err) {
+			notify({ type: "debug", message: "启动音频采集失败: " + err });
+		}
+
+		return () => {
+			try {
+				if (winEl && origAppendChild) {
+					winEl.appendChild = origAppendChild as typeof winEl.appendChild;
+				}
+			} catch {
+				/* ignore */
+			}
+			try {
+				processor && processor.disconnect();
+			} catch {
+				/* ignore */
+			}
+			try {
+				ac && ac.close();
+			} catch {
+				/* ignore */
+			}
+		};
+	}
+
 	// —— 录制阶段：已布置并 reload，等待播放开始→采集进度→结束 ——
 	if (sessionStorage.getItem(PLAY_ARMED)) {
 		let started = false;
 		let total = 0;
+		let stopAudio: (() => void) | null = null;
 		notify({ type: "splash-done" });
 		const iv = setInterval(() => {
 			const s = w._status;
@@ -75,6 +196,8 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 					} catch {
 						/* ignore */
 					}
+					// 启动音频采集并触发 BGM（回放默认不放背景音乐）。
+					stopAudio = startAudioCapture();
 					notify({ type: "recording-start" });
 				} else {
 					s.videoDuration = 1;
@@ -88,6 +211,10 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 			if (started && s.over) {
 				clearInterval(iv);
 				sessionStorage.removeItem(PLAY_ARMED);
+				if (stopAudio) {
+					stopAudio();
+					stopAudio = null;
+				}
 				// 给最后一帧留出渲染时间再结束。
 				setTimeout(() => notify({ type: "over" }), 500);
 			}

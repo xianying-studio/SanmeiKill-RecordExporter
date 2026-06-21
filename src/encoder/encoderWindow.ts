@@ -98,6 +98,11 @@ export class EncoderWindow {
 		this.send({ type: "frame", buffer: bgra, timestampSec });
 	}
 
+	/** 推送一块 PCM 音频（来自离屏窗口的 Web Audio 采集）。 */
+	pushAudio(ch0: Float32Array, ch1: Float32Array, frames: number): void {
+		this.send({ type: "audio", ch0, ch1, frames });
+	}
+
 	/** 通知编码结束，等待并返回最终 MP4 字节。 */
 	async finish(): Promise<Buffer> {
 		const done = new Promise<Buffer>((resolve, reject) => {
