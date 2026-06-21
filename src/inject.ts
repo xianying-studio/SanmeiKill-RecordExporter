@@ -83,6 +83,26 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 
 	try {
 		const req = indexedDB.open(dbName, 4);
+		// 注入脚本在游戏 boot 之前运行：若数据库尚未由游戏创建，open 会得到一个空库。
+		// 必须与游戏一致地建好对象存储，否则后续事务会抛 NotFoundError（object store not found）。
+		req.onupgradeneeded = () => {
+			const db = req.result;
+			if (!db.objectStoreNames.contains("video")) {
+				db.createObjectStore("video", { keyPath: "time" });
+			}
+			if (!db.objectStoreNames.contains("image")) {
+				db.createObjectStore("image");
+			}
+			if (!db.objectStoreNames.contains("audio")) {
+				db.createObjectStore("audio");
+			}
+			if (!db.objectStoreNames.contains("config")) {
+				db.createObjectStore("config");
+			}
+			if (!db.objectStoreNames.contains("data")) {
+				db.createObjectStore("data");
+			}
+		};
 		req.onsuccess = () => {
 			const db = req.result;
 			try {
