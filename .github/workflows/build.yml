@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: 构建（${{ matrix.os }}）
+    name: 构建 (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -59,9 +59,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: 发布 Release（runId 作为版本）
+    name: 发布 Release
     needs: build
-    # develop 分支仅构建产物，不创建 Release
     if: github.ref != 'refs/heads/develop'
     runs-on: ubuntu-latest
     permissions:
