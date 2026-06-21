@@ -178,8 +178,9 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			opts.signal.addEventListener("abort", onAbort);
 		}
 
-		const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
-		timer = setTimeout(() => fail(new Error("录制超时")), timeoutMs);
+		// 拒绝任务超时，防止导出到一半被中断
+		// const timeoutMs = opts.timeoutMs ?? 30 * 60 * 1000;
+		// timer = setTimeout(() => fail(new Error("录制超时")), timeoutMs);
 
 		encoder
 			.open()
