@@ -413,8 +413,43 @@ function buildDiagnosticsScript(): string {
 				info.hasEvent = !!s.event;
 				info.eventName = s.event && s.event.name;
 			}
+			// 诊断「8人身份局角色/手牌不显示」：上报玩家节点的真实运行时状态，
+			// 据此区分「节点不存在 / 在视口外 / 透明不可见 / 存在且可见(则为 paint 丢层)」。
+			try {
+				const players = document.querySelectorAll("#arena .player");
+				info.playerCount = players.length;
+				const arena = document.querySelector("#arena") as HTMLElement | null;
+				if (arena) {
+					const ar = arena.getBoundingClientRect();
+					const acs = getComputedStyle(arena);
+					info.arena = {
+						rect: [Math.round(ar.left), Math.round(ar.top), Math.round(ar.width), Math.round(ar.height)],
+						transform: acs.transform,
+						opacity: acs.opacity,
+						display: acs.display,
+						filter: acs.filter,
+					};
+				}
+				const p0 = players[0] as HTMLElement | undefined;
+				if (p0) {
+					const r = p0.getBoundingClientRect();
+					const cs = getComputedStyle(p0);
+					info.player0 = {
+						rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+						inViewport: r.left < window.innerWidth && r.top < window.innerHeight && r.right > 0 && r.bottom > 0,
+						opacity: cs.opacity,
+						visibility: cs.visibility,
+						display: cs.display,
+						transform: cs.transform,
+						willChange: cs.willChange,
+						zIndex: cs.zIndex,
+					};
+				}
+			} catch (err) {
+				info.probeErr = String(err);
+			}
 			report("heartbeat " + JSON.stringify(info));
-			if (ticks >= 60) {
+			if (ticks >= 600) {
 				clearInterval(iv);
 			}
 		}, 1000);
