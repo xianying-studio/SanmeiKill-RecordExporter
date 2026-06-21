@@ -284,12 +284,15 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 			if (started && s.over) {
 				clearInterval(iv);
 				sessionStorage.removeItem(PLAY_ARMED);
-				if (stopAudio) {
-					stopAudio();
-					stopAudio = null;
-				}
-				// 给最后一帧留出渲染时间再结束。
-				setTimeout(() => notify({ type: "over" }), 500);
+				// 结算画面出现后再多录 5 秒，确保玩家能看清结算画面，再结束视频；
+				// 这 5 秒内不停止音频采集(stopAudio 会还原 hook、可能中断 BGM)，5 秒后再停采集并发 over。
+				setTimeout(() => {
+					if (stopAudio) {
+						stopAudio();
+						stopAudio = null;
+					}
+					notify({ type: "over" });
+				}, 5000);
 			}
 		}, 150);
 		return;
