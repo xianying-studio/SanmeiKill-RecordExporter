@@ -33,6 +33,9 @@ interface NotifyMessage {
 	message?: string;
 }
 
+/** WebSocket 断开时的取消原因（中止录制并清理后台残留窗口）。 */
+const ABORT_REASON = "已取消：WebSocket 连接已断开";
+
 /**
  * 离屏加载页面、注入驱动脚本播放录像、按墙钟时间戳逐帧编码为 MP4。
  *
@@ -55,9 +58,6 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		let startTime = 0;
 		let frameCount = 0;
 		let timer: NodeJS.Timeout | null = null;
-
-		// WebSocket 断开时的取消原因（中止录制并清理后台残留窗口）。
-		const ABORT_REASON = "已取消：WebSocket 连接已断开";
 
 		const cleanup = () => {
 			if (timer) {

@@ -122,6 +122,7 @@ function startExport(payload: ExportPayload): void {
 async function runExport(payload: ExportPayload, msg: VideoMessage, conn: ExporterConnection, signal?: AbortSignal): Promise<void> {
 	// 0. 若连接已断开，直接放弃（不弹保存对话框）。
 	if (signal?.aborted) {
+		console.warn("[record-exporter] 连接已断开，放弃导出。");
 		return;
 	}
 	// 1. 不可见地弹出系统保存对话框（不绑定可见窗口）。
