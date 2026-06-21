@@ -303,13 +303,7 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 				if (!document.getElementById("exporter-hide-ui-style")) {
 					const st = document.createElement("style");
 					st.id = "exporter-hide-ui-style";
-					// #system：隐藏顶部回放控制条。
-					// #arena .player 强制不透明：8 人身份局玩家节点入场后 opacity 卡在 0
-					//（2 人单挑不复现），导致录像里只见背景与 UI、不见角色与手牌。
-					// 仅对「非阵亡、非隐藏」的玩家强制 opacity:1，避免破坏游戏刻意的变暗表达。
-					st.textContent =
-						"#system{display:none !important;}" +
-						"#arena .player:not(.dead):not(.hidden){opacity:1 !important;}";
+					st.textContent = "#system{display:none !important;}";
 					(document.head || document.documentElement).appendChild(st);
 				}
 			} catch {
