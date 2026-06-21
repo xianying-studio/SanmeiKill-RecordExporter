@@ -21,6 +21,13 @@
 function injectBody(linkJson: string, dbName: string, configPrefix: string, speed: number): void {
 	const w = window as any;
 	const PLAY_ARMED = "exporter_play_armed";
+	// 预热哨兵：第一次完整加载（含 JIT/SW 注册与资源缓存）完成后置位，再 reload 进入录制阶段，
+	// 使录制阶段的二次初始化命中缓存、快且稳定，便于精确控制开场遮罩停留时长。
+	const WARMED = "exporter_warmed";
+	// 加载完成→淡出事件名（游戏 init/index.ts 的 loadingManager.finish 派发，标志游戏已就绪、遮罩本应淡出）。
+	const LOADING_FADE_EVENT = "sanmei-kill:loading-fade-out";
+	// 开场遮罩停留时长（毫秒）：展示标题、无进度条/启动按钮，停留后调用原有淡出。
+	const SPLASH_HOLD_MS = 1000;
 	// 「等待压缩」系数：仅压缩回放中的各类「等待」（步间空隙 + 录像 delay 步 + videoContent 内部 game.delay），
 	// 动画时长（写死在样式表里）保持自然速度。时间戳按真实墙钟，不做 ×倍数还原，故无慢动作。
 	const SPEED = speed >= 1 ? speed : 1;
@@ -230,59 +237,122 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 		};
 	}
 
-	// —— 录制阶段：已布置并 reload，等待播放开始→采集进度→结束 ——
+	// —— 录制阶段：已布置并 reload，开场遮罩→1秒→淡出→录像+BGM ——
 	if (sessionStorage.getItem(PLAY_ARMED)) {
-		let started = false;
+		sessionStorage.removeItem(WARMED); // 清理预热哨兵，避免污染后续
+		let started = false; // 是否已开始录制（recording-start 已发）
 		let total = 0;
 		let stopAudio: (() => void) | null = null;
+		let restoreFadeOut: (() => void) | null = null; // 恢复并执行被拦截的原淡出
 		notify({ type: "splash-done" });
+
+		// 1. 隐藏开场遮罩里的进度条/文件名/启动按钮（保留「三梅杀」标题）。
+		try {
+			if (!document.getElementById("exporter-splash-style")) {
+				const st = document.createElement("style");
+				st.id = "exporter-splash-style";
+				st.textContent =
+					"#loading-screen .progress-container,#loading-screen .filename,#loading-screen .start-btn{display:none !important;}";
+				(document.head || document.documentElement).appendChild(st);
+			}
+		} catch {
+			/* ignore */
+		}
+
+		// 2. 拦截游戏「加载完成→淡出」：游戏就绪时 init/index.ts 的 finish() 会派发 LOADING_FADE_EVENT，
+		//    随后同步 classList.add('fade-out') 并 600ms 后 remove()。我们在事件回调里接管 #loading-screen：
+		//    下一帧移除 fade-out 类、空置其 remove()，把遮罩「钉住」；保留 restoreFadeOut 以便 1 秒后再放行淡出。
+		const onLoadingFade = () => {
+			window.removeEventListener(LOADING_FADE_EVENT, onLoadingFade);
+			const screen = document.getElementById("loading-screen");
+			if (!screen) {
+				// 无遮罩可钉，直接进入「开始录制+淡出」逻辑（兜底）。
+				beginRecording();
+				return;
+			}
+			const origRemove = screen.remove.bind(screen);
+			// 钉住：取消即将到来的淡出与移除。
+			requestAnimationFrame(() => screen.classList.remove("fade-out"));
+			(screen as any).remove = () => {
+				/* 暂缓移除，待 restoreFadeOut 放行 */
+			};
+			restoreFadeOut = () => {
+				(screen as any).remove = origRemove;
+				screen.classList.add("fade-out");
+				setTimeout(() => {
+					try {
+						origRemove();
+					} catch {
+						/* ignore */
+					}
+				}, 600);
+			};
+			// 游戏已就绪、遮罩已钉住：此刻开始录制（录到开场遮罩+标题）。
+			beginRecording();
+		};
+		window.addEventListener(LOADING_FADE_EVENT, onLoadingFade);
+
+		// 3. 开始录制 + 保持 1 秒 + 淡出 + 启动录像计时与 BGM。
+		function beginRecording(): void {
+			if (started) {
+				return;
+			}
+			started = true;
+			// 隐藏顶部回放控制条（#system）。用 !important 规则，避免被回放初始化 show() 盖回。
+			try {
+				if (!document.getElementById("exporter-hide-ui-style")) {
+					const st = document.createElement("style");
+					st.id = "exporter-hide-ui-style";
+					st.textContent = "#system{display:none !important;}";
+					(document.head || document.documentElement).appendChild(st);
+				}
+			} catch {
+				/* ignore */
+			}
+			// 先发 recording-start 确立 recorder 端统一时钟基准（此刻录到的是开场遮罩+标题）。
+			notify({ type: "recording-start" });
+			// 保持 1 秒开场，再放行淡出并启动音频采集与 BGM。
+			setTimeout(() => {
+				if (restoreFadeOut) {
+					restoreFadeOut();
+					restoreFadeOut = null;
+				}
+				// 淡出开始的同时启动音频采集 + 触发并补发初始 BGM，使 BGM 与露出的游戏画面同步起点。
+				if (!stopAudio) {
+					stopAudio = startAudioCapture();
+				}
+			}, SPLASH_HOLD_MS);
+		}
+
+		// 4. 兜底：若某些环境下 LOADING_FADE_EVENT 未触发，用 _status.video 作为后备触发开始录制。
+		const fallbackStart = setTimeout(() => {
+			if (!started) {
+				window.removeEventListener(LOADING_FADE_EVENT, onLoadingFade);
+				beginRecording();
+			}
+		}, 30000);
+
+		// 5. 进度采集与结束判定。
 		const iv = setInterval(() => {
 			const s = w._status;
 			if (!s) {
 				return;
 			}
-			// 播放开始的判定以 _status.video 为主信号：它在 game.playVideoContent 中被置为 true，
-			// 且整段播放期间保持为真，比「当前事件恰为录像根事件」更稳定（后者会因子事件入栈而频繁错过）。
 			if (s.video) {
 				const videoEvent = findVideoEvent(s);
-				// 录像数组首次可见时一次性锁定总步数作为进度分母：
-				// 数组随播放只减不增，故「首见长度」即为最大值，total 此后不再变更，进度保持单调。
 				if (total === 0 && videoEvent) {
 					total = Math.max(1, videoEvent.video.length);
 				}
-				if (!started) {
-					started = true;
-					s.videoDuration = 1 / SPEED;
-					try {
-						// 用 !important 的 CSS 规则隐藏顶部回放控制条（#system：选项/返回/重播/暂停/原速/减速/加速）。
-						// 不用 ui.system.style.display='none'：回放初始化(content.js:4513-4515)会把它设回 display:'' 并 show()，
-						// 单次内联设置会被盖回；注入的 !important 规则优先级最高，引擎再 show() 也无法覆盖。
-						if (!document.getElementById("exporter-hide-ui-style")) {
-							const st = document.createElement("style");
-							st.id = "exporter-hide-ui-style";
-							st.textContent = "#system{display:none !important;}";
-							(document.head || document.documentElement).appendChild(st);
-						}
-					} catch {
-						/* ignore */
-					}
-					// 先发 recording-start（让 recorder 端确立统一时钟基准 startTime），再启动音频采集，
-					// 否则 startAudioCapture 内补发的「初始 BGM」事件会早于 recording-start 到达，
-					// 此时 recorder 的 startTime 仍为 0 而被丢弃 —— 这正是 BGM 始终从开头缺失的根因。
-					notify({ type: "recording-start" });
-					// 启动音频事件采集 + 触发并补发初始 BGM。
-					stopAudio = startAudioCapture();
-				} else {
-					s.videoDuration = 1 / SPEED;
-					if (videoEvent && total > 0) {
-						const remaining = videoEvent.video.length;
-						const pct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
-						notify({ type: "progress", percent: pct });
-					}
+				s.videoDuration = 1 / SPEED;
+				if (started && videoEvent && total > 0) {
+					const remaining = videoEvent.video.length;
+					const pct = Math.max(0, Math.min(100, ((total - remaining) / total) * 100));
+					notify({ type: "progress", percent: pct });
 				}
 			}
 			if (started && s.over) {
 				clearInterval(iv);
+				clearTimeout(fallbackStart);
 				sessionStorage.removeItem(PLAY_ARMED);
 				// 结算画面出现后再多录 5 秒，确保玩家能看清结算画面，再结束视频；
 				// 这 5 秒内不停止音频采集(stopAudio 会还原 hook、可能中断 BGM)，5 秒后再停采集并发 over。
@@ -298,7 +368,35 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 		return;
 	}
 
-	// —— 布置阶段：写录像 + 配置 + playback 标记，然后 reload ——
+	// —— 预热阶段：首次完整加载已就绪，置位 PLAY_ARMED 并 reload 进入录制阶段 ——
+	// 预热目的：让 JIT/Service Worker 注册与资源缓存在「不录制」的这一遍完成，
+	// 使下一遍（录制阶段）的初始化命中缓存、快且稳定，便于精确控制开场遮罩停留 1 秒。
+	if (sessionStorage.getItem(WARMED)) {
+		const armAndReload = () => {
+			try {
+				sessionStorage.setItem(PLAY_ARMED, "1");
+				sessionStorage.removeItem(WARMED);
+				location.reload();
+			} catch (e) {
+				notify({ type: "error", message: "预热后置位录制标记失败：" + e });
+			}
+		};
+		// 游戏就绪（派发淡出事件）后即 reload 进入录制；兜底超时同样 reload，避免卡死。
+		const fade = () => {
+			window.removeEventListener(LOADING_FADE_EVENT, fade);
+			armAndReload();
+		};
+		window.addEventListener(LOADING_FADE_EVENT, fade);
+		setTimeout(() => {
+			window.removeEventListener(LOADING_FADE_EVENT, fade);
+			if (!sessionStorage.getItem(PLAY_ARMED)) {
+				armAndReload();
+			}
+		}, 30000);
+		return;
+	}
+
+	// —— 布置阶段：写录像 + 配置 + 预热标记，然后 reload ——
 	let link: any;
 	try {
 		link = JSON.parse(linkJson);
@@ -341,7 +439,8 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 				try {
 					localStorage.setItem(configPrefix + "playbackmode", link.mode);
 					localStorage.setItem(configPrefix + "playback", String(link.time));
-					sessionStorage.setItem(PLAY_ARMED, "1");
+					// 先进入「预热」阶段（非录制）：本次 reload 让游戏完整加载并缓存资源，下一遍才录制。
+					sessionStorage.setItem(WARMED, "1");
 					// 关键：跳过 reload 后的「启动!」开屏门禁，否则离屏环境无人点击会永久卡在
 					// 「正在加载游戏… 100%」（JIT entry.ts 的 passStartGate 与 core entry.ts 均看此标记）。
 					sessionStorage.setItem("sanmei-kill-user-started", "true");
