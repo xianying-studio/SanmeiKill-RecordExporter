@@ -162,6 +162,9 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 			onLog: m => console.log("[record-exporter]", m),
 			signal,
 		});
+		if (signal?.aborted) {
+			return;
+		}
 		// 4. 写盘并汇报完成。
 		await fs.promises.writeFile(savePath, buffer);
 		conn.progress("encode", 100);
