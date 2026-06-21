@@ -22,6 +22,8 @@ export interface RecordOptions {
 	onLog?: (message: string) => void;
 	/** 整体超时（毫秒），超时则失败。 */
 	timeoutMs?: number;
+	/** 取消信号：触发后立即中止录制并清理离屏/编码器窗口。 */
+	signal?: AbortSignal;
 }
 
 /** 来自注入脚本的回报消息类型。 */
@@ -30,6 +32,9 @@ interface NotifyMessage {
 	percent?: number;
 	message?: string;
 }
+
+/** WebSocket 断开时的取消原因（中止录制并清理后台残留窗口）。 */
+const ABORT_REASON = "已取消：WebSocket 连接已断开";
 
 /**
  * 离屏加载页面、注入驱动脚本播放录像、按墙钟时间戳逐帧编码为 MP4。
@@ -59,6 +64,7 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 				clearTimeout(timer);
 				timer = null;
 			}
+			opts.signal?.removeEventListener("abort", onAbort);
 			ipcMain.removeListener("offscreen:notify", onNotify);
 			if (offscreen && !offscreen.isDestroyed()) {
 				offscreen.destroy();
@@ -75,6 +81,8 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			cleanup();
 			reject(err);
 		};
+
+		const onAbort = () => fail(new Error(ABORT_REASON));
 
 		const succeed = (buf: Buffer) => {
 			if (settled) {
@@ -146,6 +154,14 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		};
 
 		ipcMain.on("offscreen:notify", onNotify);
+
+		if (opts.signal) {
+			if (opts.signal.aborted) {
+				fail(new Error(ABORT_REASON));
+				return;
+			}
+			opts.signal.addEventListener("abort", onAbort);
+		}
 
 		const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
 		timer = setTimeout(() => fail(new Error("录制超时")), timeoutMs);

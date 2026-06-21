@@ -78,6 +78,8 @@ function handleProtocolUrl(url: string | undefined | null): void {
  */
 function startExport(payload: ExportPayload): void {
 	let handled = false; // 一次拉起只处理一条录像
+	let finished = false; // 导出已结束（成功/失败/已退出），避免重复处理
+	let aborter: AbortController | null = null; // 当前导出的取消控制器
 	const closeServer = startWsServer(payload.listenport, payload.baseurl, {
 		onVideo: (msg, conn) => {
 			if (handled) {
@@ -85,12 +87,27 @@ function startExport(payload: ExportPayload): void {
 			}
 			handled = true;
 			exporting = true;
-			runExport(payload, msg, conn).finally(() => {
+			aborter = new AbortController();
+			runExport(payload, msg, conn, aborter.signal).finally(() => {
+				finished = true;
 				exporting = false;
 				closeServer();
 				// 让最后的 WS 消息（done/error）有机会送达后再退出。
 				setTimeout(() => app.quit(), 300);
 			});
+		},
+		onClose: () => {
+			// WebSocket 意外中断（如网页被关闭）：立即结束本地待运行的任务并退出残留进程。
+			if (finished) {
+				return;
+			}
+			finished = true;
+			if (aborter) {
+				aborter.abort();
+			}
+			exporting = false;
+			closeServer();
+			app.quit();
 		},
 	});
 }
@@ -100,8 +117,14 @@ function startExport(payload: ExportPayload): void {
  * @param payload 协议载荷
  * @param msg 网页端发来的录像消息
  * @param conn 向网页端汇报进度的连接
+ * @param signal 取消信号：WebSocket 断开时触发，用于中止导出
  */
-async function runExport(payload: ExportPayload, msg: VideoMessage, conn: ExporterConnection): Promise<void> {
+async function runExport(payload: ExportPayload, msg: VideoMessage, conn: ExporterConnection, signal?: AbortSignal): Promise<void> {
+	// 0. 若连接已断开，直接放弃（不弹保存对话框）。
+	if (signal?.aborted) {
+		console.warn("[record-exporter] 连接已断开，放弃导出。");
+		return;
+	}
 	// 1. 不可见地弹出系统保存对话框（不绑定可见窗口）。
 	conn.progress("save", 0);
 	const defaultName = (msg.filename || "三梅杀录像").replace(/[\\/:*?"<>|]/g, "-") + ".mp4";
@@ -137,7 +160,11 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 			fps: RECORD_FPS,
 			onStage: (stage, percent) => conn.progress(stage, percent),
 			onLog: m => console.log("[record-exporter]", m),
+			signal,
 		});
+		if (signal?.aborted) {
+			return;
+		}
 		// 4. 写盘并汇报完成。
 		await fs.promises.writeFile(savePath, buffer);
 		conn.progress("encode", 100);
