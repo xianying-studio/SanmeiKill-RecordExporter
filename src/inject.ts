@@ -112,13 +112,31 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 					localStorage.setItem(configPrefix + "playbackmode", link.mode);
 					localStorage.setItem(configPrefix + "playback", String(link.time));
 					sessionStorage.setItem(PLAY_ARMED, "1");
+					db.close();
 					location.reload();
 				} catch (e) {
 					notify({ type: "error", message: "设置播放标记失败：" + e });
+					try {
+						db.close();
+					} catch {
+						/* ignore */
+					}
 				}
 			};
-			tx.onerror = () => notify({ type: "error", message: "写入录像/配置失败" });
+			tx.onerror = () => {
+				try {
+					db.close();
+				} catch {
+					/* ignore */
+				}
+				notify({ type: "error", message: "写入录像/配置失败" });
+			};
 		} catch (e) {
+			try {
+				db.close();
+			} catch {
+				/* ignore */
+			}
 			notify({ type: "error", message: "IndexedDB 事务失败：" + e });
 		}
 	}
@@ -128,6 +146,7 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string): voi
 		// 硬编码版本号是不可靠的：若游戏库版本更高会触发 VersionError；
 		// 若版本相同却缺少对象存储则 onupgradeneeded 不触发，事务抛 NotFoundError。
 		const probe = indexedDB.open(dbName);
+		probe.onupgradeneeded = () => ensureStores(probe.result);
 		probe.onsuccess = () => {
 			const db = probe.result;
 			const needUpgrade = REQUIRED_STORES.some(name => !db.objectStoreNames.contains(name));
