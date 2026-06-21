@@ -450,6 +450,45 @@ function buildDiagnosticsScript(): string {
 						transition: cs.transition,
 						animationName: cs.animationName,
 						animationPlayState: cs.animationPlayState,
+						arenaClass: (document.querySelector("#arena") as HTMLElement | null)?.className || "",
+						avatarBg: (() => {
+							try {
+								const av = p0.querySelector(".avatar") as HTMLElement | null;
+								if (!av) return "(无.avatar)";
+								const acs2 = getComputedStyle(av);
+								return { bg: (acs2.backgroundImage || "").slice(0, 50), op: acs2.opacity };
+							} catch (e) {
+								return { err: String(e) };
+							}
+						})(),
+						opacitySources: (() => {
+							const out: any[] = [];
+							try {
+								for (const sheet of Array.from(document.styleSheets) as any[]) {
+									let rules: any;
+									try {
+										rules = sheet.cssRules;
+									} catch {
+										out.push({ href: sheet.href || "(inline)", err: "跨源不可读" });
+										continue;
+									}
+									if (!rules) continue;
+									for (const rule of Array.from(rules) as any[]) {
+										if (!rule.selectorText || !rule.style || rule.style.opacity === "") continue;
+										let m = false;
+										try {
+											m = (p0 as any).matches(rule.selectorText);
+										} catch {
+											/* 含伪元素，忽略 */
+										}
+										if (m) out.push({ sel: rule.selectorText, op: rule.style.opacity, href: (sheet.href || "(inline)").split("/").slice(-2).join("/") });
+									}
+								}
+							} catch (e) {
+								out.push({ err: String(e) });
+							}
+							return out;
+						})(),
 						timelineTime: (document.timeline && document.timeline.currentTime) || null,
 						animations: (() => {
 							try {
