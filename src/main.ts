@@ -64,7 +64,7 @@ app.commandLine.appendSwitch("high-dpi-support", "1");
 // 移除应用菜单：本工具无前台界面，macOS 默认会在屏幕顶部显示应用菜单栏，
 // 其中「View → Toggle Developer Tools」（及 ⌥⌘I 快捷键）会暴露开发者工具入口。
 // 置空菜单即可去除该菜单栏与相关快捷键（Windows/Linux 亦移除窗口菜单）。
-Menu.setApplicationMenu(null);
+app.whenReady().then(() => Menu.setApplicationMenu(null));
 
 // 注册 app:// 协议（必须在 app ready 之前声明），用于编码器窗口加载本地资源与 mediabunny。
 registerAppScheme();
