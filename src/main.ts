@@ -1,4 +1,4 @@
-import { app, dialog } from "electron";
+import { app, dialog, Menu } from "electron";
 import path from "path";
 import fs from "fs";
 import { PROTOCOL, parseProtocolUrl, type ExportPayload } from "./protocol";
@@ -60,6 +60,11 @@ app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 // 录制为后台无界面场景，固定 1:1 既消除该不一致，也避免以更高分辨率渲染、降低开销。
 app.commandLine.appendSwitch("force-device-scale-factor", "1");
 app.commandLine.appendSwitch("high-dpi-support", "1");
+
+// 移除应用菜单：本工具无前台界面，macOS 默认会在屏幕顶部显示应用菜单栏，
+// 其中「View → Toggle Developer Tools」（及 ⌥⌘I 快捷键）会暴露开发者工具入口。
+// 置空菜单即可去除该菜单栏与相关快捷键（Windows/Linux 亦移除窗口菜单）。
+Menu.setApplicationMenu(null);
 
 // 注册 app:// 协议（必须在 app ready 之前声明），用于编码器窗口加载本地资源与 mediabunny。
 registerAppScheme();
