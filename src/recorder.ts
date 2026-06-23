@@ -15,7 +15,7 @@ export interface RecordOptions {
 	height: number;
 	/** 采样帧率（离屏 paint 的 setFrameRate；倍速下应尽量高，Electron offscreen 上限 240）。 */
 	fps: number;
-	/** 录制倍速：游戏以此倍速回放，帧/音频时间戳 ×speed 还原为正常速度。默认 1。 */
+	/** 等待压缩系数：仅供注入脚本使用，用于压缩回放中的各类「等待」。不影响帧/音频时间戳；默认 1。 */
 	speed?: number;
 	/** 码率（可选，缺省走 mediabunny 的 QUALITY_HIGH）。 */
 	bitrate?: number;
@@ -41,7 +41,7 @@ interface NotifyMessage {
 
 /** 一条音频播放事件（视频时间戳由 recorder 端统一时钟打戳）。 */
 interface AudioEvent {
-	/** 视频时间（秒，已 ×speed 还原）。 */
+	/** 视频时间（秒，真实墙钟相对 recording-start）。 */
 	t: number;
 	/** 音频文件 URL（与 audioFiles 的 key 对应）。 */
 	url: string;
@@ -55,9 +55,9 @@ const ABORT_REASON = "已取消：WebSocket 连接已断开";
 /**
  * 离屏加载页面、注入驱动脚本播放录像、按墙钟时间戳逐帧编码为 MP4。
  *
- * 帧来源为离屏窗口的 paint 事件（NativeImage / BGRA）。时间戳采用「墙钟相对时间 × speed」：
- * 游戏以 speed 倍速回放（真实耗时缩短为 1/speed），帧时间戳 ×speed 后还原为正常速度的视频。
- * 音频不实时采集 PCM（倍速会变调），而是收集「播放事件 + 文件」，由编码端离线混音定位到正确时间。
+	 * 帧来源为离屏窗口的 paint 事件（NativeImage / BGRA）。时间戳采用「recording-start 后的真实墙钟相对时间」：
+	 * 注入脚本可用 speed 压缩回放中的各类「等待」，但 recorder 端不对时间戳做倍速换算。
+	 * 音频不实时采集 PCM（倍速会变调），而是收集「播放事件 + 文件」，由编码端离线混音定位到正确时间。
  *
  * @returns 编码完成的 MP4 字节
  */

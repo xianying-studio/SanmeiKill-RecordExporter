@@ -78,6 +78,15 @@ app.commandLine.appendSwitch("high-dpi-support", "1");
 //   - disable-frame-rate-limit：解除 60fps 上限，允许 BeginFrame 追平墙钟节拍。
 //   - ignore-gpu-blocklist / enable-gpu-rasterization / enable-zero-copy：解 GPU 黑名单回退、
 //     用 GPU 光栅化承担合成开销，避免软件光栅化把渲染线程打满进一步拖慢出帧。
+
+// —— macOS GPU 加速 ——
+// 离屏渲染（OSR）每帧画面仍需先经 GPU 光栅化、再读回 CPU 供 paint 事件使用。
+// Windows 默认即启用 GPU 光栅化，动画顺畅；但 macOS 上 Chromium 常因 GPU 黑名单（blocklist）
+// 把渲染回退到软件光栅化（CPU/SwiftShader）。密集动画（大量 transform/全屏特效）会把 CPU 打满，
+// 主线程被光栅化拖慢，逐帧推进的动画与游戏计时一并被拖慢，观感即「慢放」。
+// 解除黑名单并强制开启 GPU 光栅化（含 zero-copy），让 macOS 与 Windows 一样走硬件加速。
+// 仅在 macOS 生效：Windows 默认行为已正常，无需改动以免引入回归。
+
 if (process.platform === "darwin") {
 	app.commandLine.appendSwitch("disable-gpu-vsync");
 	app.commandLine.appendSwitch("disable-frame-rate-limit");
