@@ -41,7 +41,7 @@ interface NotifyMessage {
 
 /** 一条音频播放事件（视频时间戳由 recorder 端统一时钟打戳）。 */
 interface AudioEvent {
-	/** 视频时间（秒，已 ×speed 还原）。 */
+	/** 视频时间（秒，真实墙钟相对 recording-start）。 */
 	t: number;
 	/** 音频文件 URL（与 audioFiles 的 key 对应）。 */
 	url: string;
