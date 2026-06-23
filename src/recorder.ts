@@ -15,7 +15,7 @@ export interface RecordOptions {
 	height: number;
 	/** 采样帧率（离屏 paint 的 setFrameRate；倍速下应尽量高，Electron offscreen 上限 240）。 */
 	fps: number;
-	/** 录制倍速：游戏以此倍速回放，帧/音频时间戳 ×speed 还原为正常速度。默认 1。 */
+	/** 等待压缩系数：仅供注入脚本使用，用于压缩回放中的各类「等待」。不影响帧/音频时间戳；默认 1。 */
 	speed?: number;
 	/** 码率（可选，缺省走 mediabunny 的 QUALITY_HIGH）。 */
 	bitrate?: number;
