@@ -1,4 +1,4 @@
-import { app, dialog } from "electron";
+import { app, dialog, Menu } from "electron";
 import path from "path";
 import fs from "fs";
 import { PROTOCOL, parseProtocolUrl, type ExportPayload } from "./protocol";
@@ -6,6 +6,7 @@ import { startWsServer, type ExporterConnection, type VideoMessage } from "./wsS
 import { registerAppScheme, handleAppScheme } from "./appProtocol";
 import { recordOffscreen } from "./recorder";
 import { buildInjectScript } from "./inject";
+import { dlog } from "./debugLog";
 
 /**
  * 三梅杀录像导出工具 —— 主进程入口。
@@ -26,10 +27,17 @@ let receivedProtocolUrl = false;
 /** 是否正在导出（录制中临时窗口关闭不应触发整体退出）。 */
 let exporting = false;
 
-/** 录制画面尺寸与帧率（离屏窗口逻辑尺寸）。 */
-const RECORD_WIDTH = 1280;
-const RECORD_HEIGHT = 720;
-const RECORD_FPS = 30;
+/** 录制画面尺寸（离屏窗口逻辑尺寸）。 */
+const RECORD_WIDTH = 1920;
+const RECORD_HEIGHT = 1080;
+
+/**
+ * 等待压缩系数：=1 表示原速录制（不压缩任何等待，观感与实际游戏一致）。
+ * 历史上曾尝试 >1 压缩各类「等待」以加快导出，但实测加速后观感不佳（动画与节奏割裂），故改回原速。
+ * 保留该参数与链路：若将来需要再次提速，调大此值即可（注入脚本据此压缩 videoDuration 与 lib.config.duration）。
+ */
+const WAIT_COMPRESS = 1;
+const CAPTURE_FPS = 60;
 
 /** 游戏 IndexedDB 数据库名与配置前缀（configprefix 固定为 noname_0.9_）。 */
 const GAME_DB_NAME = "noname_0.9_data";
@@ -41,6 +49,35 @@ const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
 	app.quit();
 }
+
+// 放开自动播放策略：离屏录制无用户手势，否则游戏的 <audio>.play() 与音频采集
+// AudioContext 会被 Chromium 自动播放策略阻塞，导致录制出的视频无声。
+// 注意：离屏窗口仍设 setAudioMuted(true)，故放开自动播放不会导致主机外放。
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
+// 强制设备像素缩放为 1：离屏 paint 的 image.getBitmap() 返回的是「物理像素」，而 image.getSize()
+// 返回「逻辑像素」。若系统显示缩放 >100%，两者不一致会导致按逻辑尺寸构造的 VideoSample 字节数不符而抛错。
+// 录制为后台无界面场景，固定 1:1 既消除该不一致，也避免以更高分辨率渲染、降低开销。
+app.commandLine.appendSwitch("force-device-scale-factor", "1");
+app.commandLine.appendSwitch("high-dpi-support", "1");
+
+// —— macOS GPU 加速 ——
+// 离屏渲染（OSR）每帧画面仍需先经 GPU 光栅化、再读回 CPU 供 paint 事件使用。
+// Windows 默认即启用 GPU 光栅化，动画顺畅；但 macOS 上 Chromium 常因 GPU 黑名单（blocklist）
+// 把渲染回退到软件光栅化（CPU/SwiftShader）。密集动画（大量 transform/全屏特效）会把 CPU 打满，
+// 主线程被光栅化拖慢，逐帧推进的动画与游戏计时一并被拖慢，观感即「慢放」。
+// 解除黑名单并强制开启 GPU 光栅化（含 zero-copy），让 macOS 与 Windows 一样走硬件加速。
+// 仅在 macOS 生效：Windows 默认行为已正常，无需改动以免引入回归。
+if (process.platform === "darwin") {
+	app.commandLine.appendSwitch("ignore-gpu-blocklist");
+	app.commandLine.appendSwitch("enable-gpu-rasterization");
+	app.commandLine.appendSwitch("enable-zero-copy");
+}
+
+// 移除应用菜单：本工具无前台界面，macOS 默认会在屏幕顶部显示应用菜单栏，
+// 其中「View → Toggle Developer Tools」（及 ⌥⌘I 快捷键）会暴露开发者工具入口。
+// 置空菜单即可去除该菜单栏与相关快捷键（Windows/Linux 亦移除窗口菜单）。
+app.whenReady().then(() => Menu.setApplicationMenu(null));
 
 // 注册 app:// 协议（必须在 app ready 之前声明），用于编码器窗口加载本地资源与 mediabunny。
 registerAppScheme();
@@ -68,6 +105,7 @@ function handleProtocolUrl(url: string | undefined | null): void {
 		return;
 	}
 	receivedProtocolUrl = true;
+	dlog("收到协议拉起, baseurl=", payload.baseurl, "listenport=", payload.listenport);
 	startExport(payload);
 }
 
@@ -78,6 +116,8 @@ function handleProtocolUrl(url: string | undefined | null): void {
  */
 function startExport(payload: ExportPayload): void {
 	let handled = false; // 一次拉起只处理一条录像
+	let finished = false; // 导出已结束（成功/失败/已退出），避免重复处理
+	let aborter: AbortController | null = null; // 当前导出的取消控制器
 	const closeServer = startWsServer(payload.listenport, payload.baseurl, {
 		onVideo: (msg, conn) => {
 			if (handled) {
@@ -85,12 +125,27 @@ function startExport(payload: ExportPayload): void {
 			}
 			handled = true;
 			exporting = true;
-			runExport(payload, msg, conn).finally(() => {
+			aborter = new AbortController();
+			runExport(payload, msg, conn, aborter.signal).finally(() => {
+				finished = true;
 				exporting = false;
 				closeServer();
 				// 让最后的 WS 消息（done/error）有机会送达后再退出。
 				setTimeout(() => app.quit(), 300);
 			});
+		},
+		onClose: () => {
+			// WebSocket 意外中断（如网页被关闭）：立即结束本地待运行的任务并退出残留进程。
+			if (finished) {
+				return;
+			}
+			finished = true;
+			if (aborter) {
+				aborter.abort();
+			}
+			exporting = false;
+			closeServer();
+			app.quit();
 		},
 	});
 }
@@ -100,8 +155,14 @@ function startExport(payload: ExportPayload): void {
  * @param payload 协议载荷
  * @param msg 网页端发来的录像消息
  * @param conn 向网页端汇报进度的连接
+ * @param signal 取消信号：WebSocket 断开时触发，用于中止导出
  */
-async function runExport(payload: ExportPayload, msg: VideoMessage, conn: ExporterConnection): Promise<void> {
+async function runExport(payload: ExportPayload, msg: VideoMessage, conn: ExporterConnection, signal?: AbortSignal): Promise<void> {
+	// 0. 若连接已断开，直接放弃（不弹保存对话框）。
+	if (signal?.aborted) {
+		console.warn("[record-exporter] 连接已断开，放弃导出。");
+		return;
+	}
 	// 1. 不可见地弹出系统保存对话框（不绑定可见窗口）。
 	conn.progress("save", 0);
 	const defaultName = (msg.filename || "三梅杀录像").replace(/[\\/:*?"<>|]/g, "-") + ".mp4";
@@ -111,7 +172,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		filters: [{ name: "MP4 视频", extensions: ["mp4"] }],
 	});
 	if (result.canceled || !result.filePath) {
-		conn.error("已取消保存");
+		conn.error("保存已被取消");
 		return;
 	}
 	const savePath = result.filePath;
@@ -126,23 +187,31 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		return;
 	}
 
-	// 3. 离屏加载游戏、注入驱动脚本、原速播放并逐帧编码为 MP4。
-	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX);
+	// 3. 离屏加载游戏、注入驱动脚本、压缩等待回放并逐帧编码为 MP4。
+	dlog("开始离屏录制, savePath=", savePath, "录像 payload 长度=", msg.payload.length, "等待压缩=", WAIT_COMPRESS);
+	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, WAIT_COMPRESS);
 	try {
 		const buffer = await recordOffscreen({
 			url: payload.baseurl,
 			injectScript,
 			width: RECORD_WIDTH,
 			height: RECORD_HEIGHT,
-			fps: RECORD_FPS,
+			fps: CAPTURE_FPS,
+			speed: WAIT_COMPRESS,
 			onStage: (stage, percent) => conn.progress(stage, percent),
-			onLog: m => console.log("[record-exporter]", m),
+			onLog: m => dlog(m),
+			signal,
 		});
+		if (signal?.aborted) {
+			return;
+		}
 		// 4. 写盘并汇报完成。
 		await fs.promises.writeFile(savePath, buffer);
+		dlog("录制完成, 已写盘, 字节=", buffer.length);
 		conn.progress("encode", 100);
 		conn.done();
 	} catch (e: any) {
+		dlog("录制失败:", e && e.message ? e.message : String(e));
 		console.error("[record-exporter] 录制失败：", e);
 		conn.error("录制失败：" + (e && e.message ? e.message : String(e)));
 	}

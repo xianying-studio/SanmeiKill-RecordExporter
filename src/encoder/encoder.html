@@ -6,26 +6,33 @@
 		<title>encoder</title>
 	</head>
 	<body>
-		<canvas id="frame" hidden></canvas>
 		<script type="module">
-			import { Output, Mp4OutputFormat, BufferTarget, CanvasSource, QUALITY_HIGH } from "/vendor/mediabunny.mjs";
+			import { Output, Mp4OutputFormat, BufferTarget, VideoSampleSource, VideoSample, AudioBufferSource, QUALITY_HIGH, QUALITY_VERY_HIGH } from "/vendor/mediabunny.mjs";
 
 			const bridge = window.encoderBridge;
-			const canvas = document.getElementById("frame");
-			const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+			// 音频混音采样率与声道数。
+			const AUDIO_SAMPLE_RATE = 48000;
+			const AUDIO_CHANNELS = 2;
 
 			let output = null;
-			let source = null;
-			let imageData = null;
+			let videoSource = null;
+			let audioSource = null;
 			let frameWidth = 0;
 			let frameHeight = 0;
 			let fps = 30;
+			let frameDuration = 1 / 30;
 			let encodedFrames = 0;
+			let firstFrameLogged = false;
+			let sizeWarned = false;
 
-			// 帧串行处理队列（尊重编码器/写入背压）。
-			const queue = [];
-			let draining = false;
+			// 视频帧队列（尊重编码器/写入背压）。帧经专用 MessagePort 从主进程直达本主世界。
+			const videoQueue = [];
+			let videoDraining = false;
 			let finishRequested = false;
+
+			// 录制结束时一次性收到的音频事件 + 文件，用于离线混音。
+			let audioData = null; // { events, files, totalDurationSec }
 
 			function log(msg) {
 				try {
@@ -33,92 +40,247 @@
 				} catch {}
 			}
 
+			/**
+			 * 探测可用的 H.264 硬件编码 codec string。
+			 * WebCodecs 在 Windows 上经 Media Foundation 走 NVENC，但具体 profile/level 是否暴露取决于驱动：
+			 * 失败的 avc1.64001f(High@3.1) 不代表无硬件，换 High@4.0 等往往命中。这里逐个用 prefer-hardware 探测，
+			 * 返回首个被支持的 codec string；全不支持则返回 null（调用方回退 no-preference 软件编码）。
+			 */
+			async function probeHwCodec(bitrateNum) {
+				if (typeof VideoEncoder === "undefined" || !VideoEncoder.isConfigSupported) {
+					return null;
+				}
+				const candidates = ["avc1.640028", "avc1.640020", "avc1.64001f", "avc1.4d4028", "avc1.42e028"];
+				for (const cs of candidates) {
+					try {
+						const r = await VideoEncoder.isConfigSupported({
+							codec: cs,
+							width: frameWidth,
+							height: frameHeight,
+							bitrate: bitrateNum,
+							framerate: fps,
+							hardwareAcceleration: "prefer-hardware",
+						});
+						if (r && r.supported) {
+							return cs;
+						}
+					} catch {}
+				}
+				return null;
+			}
+
 			async function init(msg) {
 				frameWidth = msg.width;
 				frameHeight = msg.height;
 				fps = msg.fps || 30;
-				canvas.width = frameWidth;
-				canvas.height = frameHeight;
-				imageData = ctx.createImageData(frameWidth, frameHeight);
+				frameDuration = 1 / Math.max(1, fps);
 
 				output = new Output({
 					format: new Mp4OutputFormat({ fastStart: "in-memory" }),
 					target: new BufferTarget(),
 				});
-				source = new CanvasSource(canvas, {
+
+				// 视频轨：直接编码 BGRA 原始帧（无 canvas、无逐像素 swizzle）。
+				const bitrate = typeof msg.bitrate === "number" ? msg.bitrate : QUALITY_VERY_HIGH;
+				const videoConfig = {
 					codec: "avc",
-					bitrate: typeof msg.bitrate === "number" ? msg.bitrate : QUALITY_HIGH,
-				});
-				output.addVideoTrack(source, { frameRate: fps });
+					bitrate,
+					latencyMode: "quality",
+					onEncoderConfig: config => {
+						try {
+							log(
+								"VideoEncoderConfig: " +
+									JSON.stringify({
+										codec: config.codec,
+										hardwareAcceleration: config.hardwareAcceleration,
+										width: config.codedWidth || config.width,
+										height: config.codedHeight || config.height,
+										bitrate: config.bitrate,
+										latencyMode: config.latencyMode,
+									})
+							);
+						} catch {}
+					},
+				};
+				// 探测硬件编码：命中则用 prefer-hardware + 该 codec string(NVENC)，否则 no-preference(软件，且不抛错)。
+				const hwCodec = await probeHwCodec(5000000);
+				if (hwCodec) {
+					videoConfig.hardwareAcceleration = "prefer-hardware";
+					videoConfig.fullCodecString = hwCodec;
+					log("硬件 H.264 编码可用，使用 " + hwCodec + " (prefer-hardware)");
+				} else {
+					videoConfig.hardwareAcceleration = "no-preference";
+					log("无可用 H.264 硬件编码，回退软件编码 (no-preference)");
+				}
+				videoSource = new VideoSampleSource(videoConfig);
+				output.addVideoTrack(videoSource, { frameRate: fps });
+
+				// 音频轨：AAC，固定 48kHz 双声道。后续在 finish 时离线混音填充。
+				audioSource = new AudioBufferSource({ codec: "aac", bitrate: QUALITY_HIGH });
+				output.addAudioTrack(audioSource);
+
 				await output.start();
+				log("inited " + frameWidth + "x" + frameHeight + " fps=" + fps);
 				bridge.send({ type: "inited" });
 			}
 
-			// 将 BGRA 字节填入 RGBA 的 ImageData。
-			function drawBgra(bytes) {
-				const data = imageData.data;
-				const n = data.length;
-				for (let i = 0; i < n; i += 4) {
-					data[i] = bytes[i + 2]; // R <- B
-					data[i + 1] = bytes[i + 1]; // G
-					data[i + 2] = bytes[i]; // B <- R
-					data[i + 3] = bytes[i + 3]; // A
-				}
-				ctx.putImageData(imageData, 0, 0);
-			}
-
-			async function drain() {
-				if (draining) {
-					return;
-				}
-				draining = true;
+			async function drainVideo() {
+				if (videoDraining) return;
+				videoDraining = true;
 				try {
-					while (queue.length) {
-						const item = queue.shift();
+					while (videoQueue.length) {
+						const item = videoQueue.shift();
 						const bytes = item.bytes instanceof Uint8Array ? item.bytes : new Uint8Array(item.bytes);
-						drawBgra(bytes);
-						await source.add(item.timestampSec, 1 / fps);
+						const expected = frameWidth * frameHeight * 4;
+						if (bytes.byteLength !== expected) {
+							// 字节数与 codedWidth*codedHeight*4 不符（多为设备像素缩放）：跳过该帧并告警，避免 VideoSample 抛错。
+							if (!sizeWarned) {
+								sizeWarned = true;
+								log("帧字节数不符: got " + bytes.byteLength + ", expected " + expected + " (" + frameWidth + "x" + frameHeight + ")，已跳过此类帧");
+							}
+							continue;
+						}
+						if (!firstFrameLogged) {
+							firstFrameLogged = true;
+							log("首帧到达并开始编码");
+						}
+						// 直接以 BGRA 原始像素构造 VideoSample → 交给硬件/软件编码器，省掉 canvas 与通道交换循环。
+						const sample = new VideoSample(bytes, {
+							format: "BGRA",
+							codedWidth: frameWidth,
+							codedHeight: frameHeight,
+							timestamp: item.timestampSec,
+							duration: frameDuration,
+						});
+						try {
+							await videoSource.add(sample);
+						} finally {
+							sample.close();
+						}
 						encodedFrames++;
-						if (encodedFrames % 15 === 0) {
+						if (encodedFrames % 10 === 0) {
 							bridge.send({ type: "progress", encodedFrames });
 						}
 					}
 				} catch (err) {
 					bridge.send({ type: "error", message: err && err.stack ? err.stack : String(err) });
-					draining = false;
+					videoDraining = false;
 					return;
 				}
-				draining = false;
-				if (finishRequested && queue.length === 0) {
+				videoDraining = false;
+				// 报一次最终帧数，便于进度收尾。
+				bridge.send({ type: "progress", encodedFrames });
+				if (finishRequested) {
 					await finalize();
 				}
 			}
 
+			/**
+			 * 离线混音：把所有「在某视频时间点播放某音频文件」的事件，
+			 * 用 OfflineAudioContext 渲染成一条整段 AudioBuffer，再喂给 mediabunny 音频轨。
+			 * 音量保持默认（不缩放）。BGM（loop=true）循环至视频结束。
+			 */
+			async function buildMixedAudio() {
+				if (!audioData || !audioData.events || audioData.events.length === 0) {
+					return null;
+				}
+				const totalDur = Math.max(0.1, audioData.totalDurationSec || 0);
+				const totalFrames = Math.ceil(totalDur * AUDIO_SAMPLE_RATE);
+
+				// 解码所有用到的文件（URL → AudioBuffer），用普通 AudioContext.decodeAudioData。
+				const decodeCtx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+				const decoded = {};
+				const urls = Object.keys(audioData.files || {});
+				for (const url of urls) {
+					try {
+						const bytes = audioData.files[url];
+						const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+						decoded[url] = await decodeCtx.decodeAudioData(ab);
+					} catch (err) {
+						log("decode 失败 " + url + ": " + (err && err.message ? err.message : err));
+					}
+				}
+				await decodeCtx.close();
+
+				const offline = new OfflineAudioContext(AUDIO_CHANNELS, totalFrames, AUDIO_SAMPLE_RATE);
+				for (const ev of audioData.events) {
+					const buf = decoded[ev.url];
+					if (!buf) continue;
+					if (ev.t >= totalDur) continue;
+					const src = offline.createBufferSource();
+					src.buffer = buf;
+					if (ev.loop) {
+						src.loop = true;
+						src.loopStart = 0;
+						src.loopEnd = buf.duration;
+					}
+					src.connect(offline.destination);
+					const startAt = Math.max(0, ev.t);
+					src.start(startAt);
+					// 循环音轨（BGM）在视频结束处停止。
+					if (ev.loop) {
+						src.stop(totalDur);
+					}
+				}
+				const rendered = await offline.startRendering();
+				return rendered;
+			}
+
 			async function finalize() {
 				try {
+					// 通知主进程进入「混音 + 封装」收尾阶段（无细粒度进度，UI 据此显示收尾态）。
+					log("finalize 开始, 已编码帧=" + encodedFrames);
+					bridge.send({ type: "mux-start" });
+					// 先离线混音并写入音频轨，再 finalize。
+					try {
+						const mixed = await buildMixedAudio();
+						if (mixed) {
+							await audioSource.add(mixed);
+						}
+					} catch (err) {
+						log("音频混音失败（将输出无声视频）: " + (err && err.stack ? err.stack : String(err)));
+					}
 					await output.finalize();
 					const buffer = output.target.buffer;
+					log("finalize 完成, 字节=" + (buffer && buffer.byteLength));
 					bridge.send({ type: "done", buffer, encodedFrames }, [buffer]);
 				} catch (err) {
 					bridge.send({ type: "error", message: err && err.stack ? err.stack : String(err) });
 				}
 			}
 
+			// 控制通道（init / audio-data / finish）：经隔离世界 preload 的 ipc 桥转发。
 			bridge.onMessage(async msg => {
 				try {
 					if (msg.type === "init") {
 						await init(msg);
-					} else if (msg.type === "frame") {
-						queue.push({ bytes: msg.buffer, timestampSec: msg.timestampSec });
-						drain();
+					} else if (msg.type === "audio-data") {
+						audioData = { events: msg.events || [], files: msg.files || {}, totalDurationSec: msg.totalDurationSec || 0 };
 					} else if (msg.type === "finish") {
 						finishRequested = true;
-						if (!draining && queue.length === 0) {
+						log("收到 finish, 待编码队列=" + videoQueue.length + " draining=" + videoDraining + " 已编码=" + encodedFrames);
+						if (!videoDraining && videoQueue.length === 0) {
 							await finalize();
 						}
 					}
 				} catch (err) {
 					bridge.send({ type: "error", message: err && err.stack ? err.stack : String(err) });
+				}
+			});
+
+			// 帧通道：preload 把主进程发来的 MessagePort 通过 window.postMessage 转入主世界（端口随消息 transfer）。
+			// 帧数据（BGRA + 时间戳）经此端口直达，避免与控制/音频大消息抢同一条 ipc 通道。
+			window.addEventListener("message", ev => {
+				if (ev.data === "encoder:frame-port" && ev.ports && ev.ports[0]) {
+					const port = ev.ports[0];
+					port.onmessage = m => {
+						const d = m.data;
+						if (d && d.bytes) {
+							videoQueue.push({ bytes: d.bytes, timestampSec: d.timestampSec });
+							drainVideo();
+						}
+					};
+					port.start && port.start();
 				}
 			});
 
