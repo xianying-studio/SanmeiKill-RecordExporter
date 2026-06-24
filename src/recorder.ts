@@ -401,10 +401,53 @@ function buildDiagnosticsScript(): string {
 			report("unhandledrejection: " + (r && r.message ? r.message : String(r)));
 		});
 
+		// 3'. 动画时钟探针：度量「单位真实时间内动画推进了多少」，用于量化 macOS 慢放。
+		//     - rafFps：每秒 requestAnimationFrame 回调次数 ≈ 合成器实际出帧帧率；
+		//     - clockRatio：document.timeline.currentTime 的推进量 / 墙钟推进量。
+		//       正常应 ≈1.0；若明显 <1（如 0.3），说明动画时钟被节流 → 即「慢放」的直接证据。
+		//     这些数字随心跳写入 debug 日志，使后续判断有据可依、不再靠猜。
+		let rafCount = 0;
+		let lastTimelineMs = 0;
+		let lastWallMs = Date.now();
+		try {
+			const tc = w.document.timeline && w.document.timeline.currentTime;
+			lastTimelineMs = typeof tc === "number" ? tc : 0;
+		} catch {
+			/* ignore */
+		}
+		const rafTick = () => {
+			rafCount++;
+			try {
+				w.requestAnimationFrame(rafTick);
+			} catch {
+				/* ignore */
+			}
+		};
+		try {
+			w.requestAnimationFrame(rafTick);
+		} catch {
+			/* ignore */
+		}
+
 		// 3. 状态心跳：每秒回报一次，便于定位卡点。
 		let ticks = 0;
 		const iv = setInterval(() => {
 			ticks++;
+			// 动画时钟探针采样（每秒）：算出本秒的 rAF 帧率与动画时钟/墙钟比值后清零计数。
+			try {
+				const nowWall = Date.now();
+				const tc = w.document.timeline && w.document.timeline.currentTime;
+				const nowTimeline = typeof tc === "number" ? tc : lastTimelineMs;
+				const wallDelta = nowWall - lastWallMs;
+				const timelineDelta = nowTimeline - lastTimelineMs;
+				const clockRatio = wallDelta > 0 ? +(timelineDelta / wallDelta).toFixed(3) : 0;
+				report(`anim-probe rafFps=${rafCount} clockRatio=${clockRatio} timelineDeltaMs=${Math.round(timelineDelta)} wallDeltaMs=${wallDelta}`);
+				rafCount = 0;
+				lastWallMs = nowWall;
+				lastTimelineMs = nowTimeline;
+			} catch {
+				/* ignore */
+			}
 			const s = w._status;
 			const info: any = {
 				t: ticks,

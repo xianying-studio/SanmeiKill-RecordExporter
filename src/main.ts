@@ -61,6 +61,31 @@ app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 app.commandLine.appendSwitch("force-device-scale-factor", "1");
 app.commandLine.appendSwitch("high-dpi-support", "1");
 
+// —— macOS 离屏录制「慢放」根因修复 ——
+// 录制走 show:false 的离屏窗口。Chromium 会把这种不可见窗口判定为「被遮挡/后台」，
+// 进而对其渲染进程施加三重节流：
+//   1) 后台定时器节流（setTimeout/setInterval 被钳到 ~1Hz）；
+//   2) 渲染进程整体后台降权（renderer backgrounding）；
+//   3) 被遮挡窗口降权（backgrounding occluded windows / 原生遮挡计算）。
+// 游戏的动画时钟（CSS 动画 / requestAnimationFrame / document.timeline）依赖这些定时与合成节拍，
+// 一旦被节流，单位真实时间内动画推进变少 → 录出来就是「慢放」。
+// webPreferences.backgroundThrottling:false 在 macOS 的离屏遮挡场景并不可靠，
+// 必须用以下命令行开关从进程级解除节流。Windows 对隐藏窗口的遮挡处理不同、本就正常，
+// 故用 darwin 守卫，保持 Windows 行为不变、避免回归。
+//
+// 前两次仅调 GPU 光栅化（ignore-gpu-blocklist / enable-gpu-rasterization）与 vsync
+// （disable-gpu-vsync）均无效，因为它们都没触及「不可见窗口被后台/遮挡节流」这一真正瓶颈。
+if (process.platform === "darwin") {
+	app.commandLine.appendSwitch("disable-background-timer-throttling");
+	app.commandLine.appendSwitch("disable-renderer-backgrounding");
+	app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+	// 关闭 macOS 原生窗口遮挡计算，避免不可见窗口被判为 occluded 后再次降权。
+	app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
+	// 保留 GPU 光栅化相关开关：对软件合成的离屏路径无害，且利于密集特效的光栅化吞吐。
+	app.commandLine.appendSwitch("ignore-gpu-blocklist");
+	app.commandLine.appendSwitch("enable-gpu-rasterization");
+}
+
 // 移除应用菜单：本工具无前台界面，macOS 默认会在屏幕顶部显示应用菜单栏，
 // 其中「View → Toggle Developer Tools」（及 ⌥⌘I 快捷键）会暴露开发者工具入口。
 // 置空菜单即可去除该菜单栏与相关快捷键（Windows/Linux 亦移除窗口菜单）。
