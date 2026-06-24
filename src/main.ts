@@ -61,29 +61,22 @@ app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 app.commandLine.appendSwitch("force-device-scale-factor", "1");
 app.commandLine.appendSwitch("high-dpi-support", "1");
 
-// —— macOS 离屏录制「慢放」根因修复 ——
-// 录制走 show:false 的离屏窗口。Chromium 会把这种不可见窗口判定为「被遮挡/后台」，
-// 进而对其渲染进程施加三重节流：
-//   1) 后台定时器节流（setTimeout/setInterval 被钳到 ~1Hz）；
-//   2) 渲染进程整体后台降权（renderer backgrounding）；
-//   3) 被遮挡窗口降权（backgrounding occluded windows / 原生遮挡计算）。
-// 游戏的动画时钟（CSS 动画 / requestAnimationFrame / document.timeline）依赖这些定时与合成节拍，
-// 一旦被节流，单位真实时间内动画推进变少 → 录出来就是「慢放」。
-// webPreferences.backgroundThrottling:false 在 macOS 的离屏遮挡场景并不可靠，
-// 必须用以下命令行开关从进程级解除节流。Windows 对隐藏窗口的遮挡处理不同、本就正常，
-// 故用 darwin 守卫，保持 Windows 行为不变、避免回归。
-//
-// 前两次仅调 GPU 光栅化（ignore-gpu-blocklist / enable-gpu-rasterization）与 vsync
-// （disable-gpu-vsync）均无效，因为它们都没触及「不可见窗口被后台/遮挡节流」这一真正瓶颈。
+// —— macOS 离屏录制「慢放」排查结论与防御性开关 ——
+// 经在真实 macOS（Apple Silicon）上用最小复现实测（app.getGPUFeatureStatus + paint 帧率对照）确认：
+//   - 创建离屏窗口后 GPU 全程在线：gpu_compositing / rasterization / canvas_oop 均为 enabled，
+//     即「macOS 没有 GPU 加速」这一最初判断不成立，GPU 加速一直都在；
+//   - 离屏窗口与可见窗口在「同一渲染负载」下帧率完全一致——离屏渲染本身无性能损失；
+//   - 动画时钟探针显示 clockRatio 恒 ≈1.0（动画时钟与墙钟严格同步），不存在「后台/遮挡节流」，
+//     故前三次围绕 GPU blocklist / vsync / 节流的命令行开关全部无效（都在解决不存在的问题）。
+// 真正的「慢放感」源于密集全屏特效超出 GPU 单帧预算时的偶发掉帧，叠加重绘泵造成的超额 readback
+// （见 recorder.ts，已改为「补帧泵」消除翻倍出帧）。下方仅保留去后台节流开关作为防御——
+// 它们对「窗口确被系统判为后台」的边缘场景有益、对当前路径无害，darwin 守卫保持 Windows 行为不变。
 if (process.platform === "darwin") {
 	app.commandLine.appendSwitch("disable-background-timer-throttling");
 	app.commandLine.appendSwitch("disable-renderer-backgrounding");
 	app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
 	// 关闭 macOS 原生窗口遮挡计算，避免不可见窗口被判为 occluded 后再次降权。
 	app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
-	// 保留 GPU 光栅化相关开关：对软件合成的离屏路径无害，且利于密集特效的光栅化吞吐。
-	app.commandLine.appendSwitch("ignore-gpu-blocklist");
-	app.commandLine.appendSwitch("enable-gpu-rasterization");
 }
 
 // 移除应用菜单：本工具无前台界面，macOS 默认会在屏幕顶部显示应用菜单栏，
