@@ -2,6 +2,9 @@
 
 用于将《三梅杀》录像导出为视频的伴侣工具，支持 Windows / macOS。
 
+> [!WARNING]
+> 本工具在 macOS 上的支持度一般，频现掉帧；仅供小范围测试，不适合用于正式用途。
+
 ## 使用方式
 
 ### 安装
@@ -11,7 +14,7 @@
 1. 在 [Releases](https://github.com/xianying-studio/SanmeiKill-RecordExporter/releases/latest) 下载 `Setup.0.1.0.exe` 后双击，接着跟随向导完成安装；
 2. 通过安装向导结束画面的「运行“三梅杀录像导出工具”」复选框打开应用或者手动打开应用，直到出现 `请通过三梅杀的「导出录像」功能唤起本应用使用。` 后即可点击 `确定` 关闭，安装完成。
 
-#### macOS
+#### macOS 测试版
 
 1. 在 [Releases](https://github.com/xianying-studio/SanmeiKill-RecordExporter/releases/latest) 下载 `-0.1.0-arm64.dmg` 后，将 `三梅杀录像导出工具` 拖放到右边的 `Applications` 文件夹；
 2. 打开终端，输入 `sudo xattr -r -d com.apple.quarantine /Applications/三梅杀录像导出工具.app` 并回车来信任此应用 (以免出现「已损坏」提示)，若仍提示不受信任，请打开 系统设置 > 隐私与安全性 > 仍要打开 完成应用信任；
