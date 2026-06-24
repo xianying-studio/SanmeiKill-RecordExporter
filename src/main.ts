@@ -61,38 +61,22 @@ app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 app.commandLine.appendSwitch("force-device-scale-factor", "1");
 app.commandLine.appendSwitch("high-dpi-support", "1");
 
-// —— macOS：修复密集动画「慢放」 ——
-// 录制走离屏渲染（OSR）。OSR 里页面的动画时钟（CSS 动画 / requestAnimationFrame / document.timeline）
-// 由合成器的 BeginFrame 节拍驱动，而非真实墙钟。本工具录制时按真实墙钟给每帧打时间戳，
-// 因此一旦 BeginFrame 的实际节拍跟不上墙钟，动画就会被「拉长」——表现即为慢放。
-//
-// 为什么仅 macOS 出问题（Windows 正常）：
-//   - 在 macOS 上，隐藏（show:false）的 OSR 窗口其 BeginFrame 源默认绑定显示器 vsync（CVDisplayLink）。
-//     窗口不可见时该 vsync 源会被严重节流甚至停摆，BeginFrame 节拍掉到远低于 60Hz →
-//     合成器/动画时钟随之变慢 → 录到的视频被拉长成慢放。
-//   - 上一次只解 GPU 黑名单 + 开 GPU 光栅化并未触及「BeginFrame 被 vsync 节流」这一真正瓶颈，故无效。
-//
-// 对症修复（仅 darwin 生效，避免影响 Windows 既有正常行为）：
-//   - disable-gpu-vsync：把 BeginFrame 源从「显示器 vsync」切到按请求帧率走的软件定时器，
-//     令隐藏 OSR 窗口也能稳定按 setFrameRate 出帧，动画时钟与墙钟对齐。
-//   - disable-frame-rate-limit：解除 60fps 上限，允许 BeginFrame 追平墙钟节拍。
-//   - ignore-gpu-blocklist / enable-gpu-rasterization / enable-zero-copy：解 GPU 黑名单回退、
-//     用 GPU 光栅化承担合成开销，避免软件光栅化把渲染线程打满进一步拖慢出帧。
-
-// —— macOS GPU 加速 ——
-// 离屏渲染（OSR）每帧画面仍需先经 GPU 光栅化、再读回 CPU 供 paint 事件使用。
-// Windows 默认即启用 GPU 光栅化，动画顺畅；但 macOS 上 Chromium 常因 GPU 黑名单（blocklist）
-// 把渲染回退到软件光栅化（CPU/SwiftShader）。密集动画（大量 transform/全屏特效）会把 CPU 打满，
-// 主线程被光栅化拖慢，逐帧推进的动画与游戏计时一并被拖慢，观感即「慢放」。
-// 解除黑名单并强制开启 GPU 光栅化（含 zero-copy），让 macOS 与 Windows 一样走硬件加速。
-// 仅在 macOS 生效：Windows 默认行为已正常，无需改动以免引入回归。
-
+// —— macOS 离屏录制「慢放」排查结论与防御性开关 ——
+// 经在真实 macOS（Apple Silicon）上用最小复现实测（app.getGPUFeatureStatus + paint 帧率对照）确认：
+//   - 创建离屏窗口后 GPU 全程在线：gpu_compositing / rasterization / canvas_oop 均为 enabled，
+//     即「macOS 没有 GPU 加速」这一最初判断不成立，GPU 加速一直都在；
+//   - 离屏窗口与可见窗口在「同一渲染负载」下帧率完全一致——离屏渲染本身无性能损失；
+//   - 动画时钟探针显示 clockRatio 恒 ≈1.0（动画时钟与墙钟严格同步），不存在「后台/遮挡节流」，
+//     故前三次围绕 GPU blocklist / vsync / 节流的命令行开关全部无效（都在解决不存在的问题）。
+// 真正的「慢放感」源于密集全屏特效超出 GPU 单帧预算时的偶发掉帧，叠加重绘泵造成的超额 readback
+// （见 recorder.ts，已改为「补帧泵」消除翻倍出帧）。下方仅保留去后台节流开关作为防御——
+// 它们对「窗口确被系统判为后台」的边缘场景有益、对当前路径无害，darwin 守卫保持 Windows 行为不变。
 if (process.platform === "darwin") {
-	app.commandLine.appendSwitch("disable-gpu-vsync");
-	app.commandLine.appendSwitch("disable-frame-rate-limit");
-	app.commandLine.appendSwitch("ignore-gpu-blocklist");
-	app.commandLine.appendSwitch("enable-gpu-rasterization");
-	app.commandLine.appendSwitch("enable-zero-copy");
+	app.commandLine.appendSwitch("disable-background-timer-throttling");
+	app.commandLine.appendSwitch("disable-renderer-backgrounding");
+	app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+	// 关闭 macOS 原生窗口遮挡计算，避免不可见窗口被判为 occluded 后再次降权。
+	app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
 }
 
 // 移除应用菜单：本工具无前台界面，macOS 默认会在屏幕顶部显示应用菜单栏，

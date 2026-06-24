@@ -82,8 +82,15 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		let frameCount = 0;
 		let timer: NodeJS.Timeout | null = null;
 		let repaintTimer: NodeJS.Timeout | null = null;
+		let lastPaintAt = 0; // 最近一次 paint 的墙钟时刻（ms），供补帧泵判断是否需要补帧
 
-		// 以采集帧率周期性强制离屏窗口整屏重绘，使每帧都把完整画面（含静止的牌桌/角色/手牌）刷进 paint 位图。
+		// 「补帧泵」：Electron 离屏渲染默认只在脏矩形变化时出 paint，静止画面（牌桌/角色/手牌不动）
+		// 不会出帧，编码器会缺帧。故周期性检查——仅当「距上一帧已超过一个采集周期」时才 invalidate() 补一帧。
+		//
+		// 关键：早期实现是「无条件每周期 invalidate」，在动画进行中（游戏自身已按 60fps 出 paint）会与之叠加，
+		// 把出帧率推到 ~100+fps（实测日志 38562 帧 / 383.59s ≈ 100fps），每多一帧就多一次 GPU→CPU 位图回读；
+		// 密集全屏特效（GPU 已接近单帧预算上限）时，这些翻倍的 readback 与游戏渲染争抢资源，加重偶发掉帧。
+		// 改为「仅在出现间隙时补帧」后，动画段不再翻倍出帧，静止段照常补满，readback 开销回落到名义帧率。
 		const startRepaintPump = () => {
 			if (repaintTimer) {
 				return;
@@ -91,6 +98,10 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			const interval = Math.max(4, Math.round(1000 / Math.max(1, opts.fps)));
 			repaintTimer = setInterval(() => {
 				if (offscreen && !offscreen.isDestroyed() && capturing) {
+					// 距上一帧不足一个采集周期，说明游戏自身正在出帧，无需补帧（避免叠加导致 readback 翻倍）。
+					if (Date.now() - lastPaintAt < interval) {
+						return;
+					}
 					try {
 						offscreen.webContents.invalidate();
 					} catch {
@@ -265,6 +276,8 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			if (!capturing || settled) {
 				return;
 			}
+			// 记录出帧时刻：补帧泵据此判断「游戏是否正在自然出帧」，避免与之叠加造成 readback 翻倍。
+			lastPaintAt = Date.now();
 			const size = image.getSize();
 			if (size.width === 0 || size.height === 0) {
 				return;
@@ -401,10 +414,53 @@ function buildDiagnosticsScript(): string {
 			report("unhandledrejection: " + (r && r.message ? r.message : String(r)));
 		});
 
+		// 3'. 动画时钟探针：度量「单位真实时间内动画推进了多少」，用于量化 macOS 慢放。
+		//     - rafFps：每秒 requestAnimationFrame 回调次数 ≈ 合成器实际出帧帧率；
+		//     - clockRatio：document.timeline.currentTime 的推进量 / 墙钟推进量。
+		//       正常应 ≈1.0；若明显 <1（如 0.3），说明动画时钟被节流 → 即「慢放」的直接证据。
+		//     这些数字随心跳写入 debug 日志，使后续判断有据可依、不再靠猜。
+		let rafCount = 0;
+		let lastTimelineMs = 0;
+		let lastWallMs = Date.now();
+		try {
+			const tc = w.document.timeline && w.document.timeline.currentTime;
+			lastTimelineMs = typeof tc === "number" ? tc : 0;
+		} catch {
+			/* ignore */
+		}
+		const rafTick = () => {
+			rafCount++;
+			try {
+				w.requestAnimationFrame(rafTick);
+			} catch {
+				/* ignore */
+			}
+		};
+		try {
+			w.requestAnimationFrame(rafTick);
+		} catch {
+			/* ignore */
+		}
+
 		// 3. 状态心跳：每秒回报一次，便于定位卡点。
 		let ticks = 0;
 		const iv = setInterval(() => {
 			ticks++;
+			// 动画时钟探针采样（每秒）：算出本秒的 rAF 帧率与动画时钟/墙钟比值后清零计数。
+			try {
+				const nowWall = Date.now();
+				const tc = w.document.timeline && w.document.timeline.currentTime;
+				const nowTimeline = typeof tc === "number" ? tc : lastTimelineMs;
+				const wallDelta = nowWall - lastWallMs;
+				const timelineDelta = nowTimeline - lastTimelineMs;
+				const clockRatio = wallDelta > 0 ? +(timelineDelta / wallDelta).toFixed(3) : 0;
+				report(`anim-probe rafFps=${rafCount} clockRatio=${clockRatio} timelineDeltaMs=${Math.round(timelineDelta)} wallDeltaMs=${wallDelta}`);
+				rafCount = 0;
+				lastWallMs = nowWall;
+				lastTimelineMs = nowTimeline;
+			} catch {
+				/* ignore */
+			}
 			const s = w._status;
 			const info: any = {
 				t: ticks,
