@@ -83,6 +83,79 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		let timer: NodeJS.Timeout | null = null;
 		let repaintTimer: NodeJS.Timeout | null = null;
 		let lastPaintAt = 0; // 最近一次 paint 的墙钟时刻（ms），供补帧泵判断是否需要补帧
+		let outputTimer: NodeJS.Timeout | null = null;
+
+		// —— CFR 输出泵：把「抖动/漏帧的 paint 采集节奏」与「恒定的视频帧率」彻底解耦 ——
+		// 背景：Electron 离屏渲染（OSR）的 paint 事件节奏不可控（macOS 上 GPU→CPU 回读开销大，
+		// 密集动画时 paint 间隔被拉长且剧烈抖动）。此前直接用「每个 paint 的墙钟时间」当帧时间戳、
+		// 却把 duration 写死成 1/fps，二者不自洽 → 视频时间轴出现空洞/倒挂 → 播放卡顿、忽快忽慢。
+		// 现在 paint 只更新「最近一帧」缓存，由本泵以固定 1/fps 节奏，把最近帧量化到严格均匀的
+		// idx×(1/fps) 时间网格上产帧（hold-last-frame，OBS/录屏软件的标准做法）：
+		// 采集再抖、再漏，输出始终是严格 CFR，且时间戳与 duration 完全一致。
+		let latestBitmap: Buffer | null = null; // 最近一帧 BGRA 位图（paint 写入，泵读取）
+		let outIdx = 0; // 下一个待产出的 CFR 帧序号（时间戳 = outIdx / fps）
+		let outStarted = false; // 是否已对齐首帧网格（首次产帧时按墙钟对齐，避免开场补一串重复帧）
+		// 诊断计数：每秒比对「真实 paint/s」与「产出 output/s」，区分 macOS 上是采集漏帧还是时间轴抖动。
+		let paintCount = 0;
+		let lastDiagMs = 0;
+		let lastDiagPaint = 0;
+		let lastDiagOut = 0;
+
+		// 单次泵 tick 最多补产的帧数上界：防御 startTime 异常或长时间挂起导致一次性灌入海量重复帧。
+		const MAX_CATCHUP = effectiveFps * 2;
+
+		const startOutputPump = () => {
+			if (outputTimer) {
+				return;
+			}
+			const slotMs = Math.max(4, Math.round(1000 / effectiveFps));
+			outputTimer = setInterval(() => {
+				if (!capturing || settled || !inited || !latestBitmap) {
+					return;
+				}
+				const targetIdx = Math.floor(((Date.now() - startTime) / 1000) * effectiveFps);
+				if (!outStarted) {
+					// 首帧：把输出序号对齐到当前墙钟槽位（首帧可能晚于 recording-start 才到达），
+					// 使首帧时间戳 ≈ 真实墙钟时间，与音频事件（同样以 startTime 为零点打戳）保持音画同步。
+					outIdx = Math.max(0, targetIdx);
+					outStarted = true;
+					emitOutputFrame();
+					outIdx++;
+				}
+				// 追平到目标网格：泵 tick 本身可能被延迟，这里把缺口用「最近帧」补满，确保严格 CFR 无空洞。
+				let budget = MAX_CATCHUP;
+				while (outIdx <= targetIdx && budget-- > 0) {
+					emitOutputFrame();
+					outIdx++;
+				}
+				if (outIdx <= targetIdx) {
+					// 触达单 tick 上界：跳过积压的缺口并重置序号，避免雪崩式补帧（仅异常路径）。
+					dlog("CFR 泵补帧超上界，跳过缺口:", targetIdx - outIdx, "帧");
+					outIdx = targetIdx + 1;
+				}
+				// 诊断心跳：每秒一次。
+				const now = Date.now();
+				if (now - lastDiagMs >= 1000) {
+					const dp = paintCount - lastDiagPaint;
+					const dout = frameCount - lastDiagOut;
+					dlog("CFR 诊断: paint/s=", dp, "output/s=", dout, "(目标", effectiveFps, ")");
+					lastDiagMs = now;
+					lastDiagPaint = paintCount;
+					lastDiagOut = frameCount;
+				}
+			}, slotMs);
+		};
+
+		// 以当前「最近一帧」缓存产出一帧，时间戳严格落在 outIdx/fps 的均匀网格上。
+		const emitOutputFrame = () => {
+			if (!latestBitmap) {
+				return;
+			}
+			const ts = outIdx / effectiveFps;
+			lastVideoTs = ts;
+			encoder.pushFrame(latestBitmap, ts);
+			frameCount++;
+		};
 
 		// 「补帧泵」：Electron 离屏渲染默认只在脏矩形变化时出 paint，静止画面（牌桌/角色/手牌不动）
 		// 不会出帧，编码器会缺帧。故周期性检查——仅当「距上一帧已超过一个采集周期」时才 invalidate() 补一帧。
@@ -137,6 +210,11 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 				clearInterval(repaintTimer);
 				repaintTimer = null;
 			}
+			if (outputTimer) {
+				clearInterval(outputTimer);
+				outputTimer = null;
+			}
+			latestBitmap = null;
 			opts.signal?.removeEventListener("abort", onAbort);
 			ipcMain.removeListener("offscreen:notify", onNotify);
 			if (offscreen && !offscreen.isDestroyed()) {
@@ -215,6 +293,9 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					// 静止时牌桌/角色/手牌区域不被重绘 → 捕获帧里只剩背景与刚变化的 UI（角色像「消失」），
 					// 唯有觉醒等全屏特效强制整屏重绘时才完整出现。周期性 invalidate() 强制每帧整屏重绘，根治该问题。
 					startRepaintPump();
+					// 启动 CFR 输出泵：以恒定 1/fps 节奏从「最近一帧」缓存产帧，与采集节奏解耦。
+					lastDiagMs = startTime;
+					startOutputPump();
 					break;
 				case "progress":
 					opts.onStage?.("record", typeof msg.percent === "number" ? msg.percent : 0);
@@ -295,11 +376,12 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					.catch(err => fail(err instanceof Error ? err : new Error(String(err))));
 				return;
 			}
-			// 时间戳：真实墙钟相对 recording-start（秒）。游戏只压缩等待、动画自然速度，故墙钟即正确视频时间线。
-			const ts = (Date.now() - startTime) / 1000;
-			lastVideoTs = ts;
-			encoder.pushFrame(image.getBitmap(), ts);
-			frameCount++;
+			// paint 只更新「最近一帧」缓存（不在此编码）：采集节奏由 OSR 决定、不可控且会抖动/漏帧；
+			// 真正的视频帧由 CFR 输出泵以恒定 1/fps 节奏从此缓存产出，彻底消除帧率不稳。
+			// 必须拷贝：getBitmap() 返回的 Buffer 不复制底层内存，仅在当前 tick 内有效，下次 paint 即被覆写/销毁；
+			// 而本缓存要跨 tick 供输出泵反复读取，故 Buffer.from 复制一份持有。
+			latestBitmap = Buffer.from(image.getBitmap());
+			paintCount++;
 		};
 
 		ipcMain.on("offscreen:notify", onNotify);
