@@ -10,6 +10,7 @@ function fixture() {
 	};
 	let created = 0;
 	const game = {
+		playBackgroundMusic() {},
 		videoContent: {
 			die: () => 42,
 			setIdentity: (target, id) => {

@@ -10,7 +10,10 @@ export function installReplayPresentation(): boolean {
 	const packageMusic = /^(?:audio\/background\/|extension\/[^/]+\/audio\/background\/)/;
 	game.videoContent.backgroundMusic = (state: any) => {
 		const audio = ui.backgroundMusic;
-		if (!audio || !state || (state.easterEgg && lib.config.disable_easter_egg_music) || lib.config.background_music === "music_off") return;
+		if (!audio || !state || lib.config.background_music === "music_off") return;
+		if (lib.config.disable_easter_egg_music) audio.addEventListener("ended", game.playBackgroundMusic);
+		else audio.removeEventListener("ended", game.playBackgroundMusic);
+		if (state.easterEgg && lib.config.disable_easter_egg_music) return;
 		if (state.paused && lib.config.disable_easter_egg_music) {
 			for (let event = _status.event, depth = 0; event && depth < 50; event = event.parent, depth++) {
 				if (!Array.isArray(event.video)) continue;
@@ -32,8 +35,12 @@ export function installReplayPresentation(): boolean {
 			}
 			if (packageMusic.test(assetPath)) state = { ...state, src: new URL(assetPath, new URL(lib.assetURL || "./", document.baseURI)).href };
 		}
-		if (typeof backgroundMusic === "function") return backgroundMusic(state);
-		audio.removeEventListener("ended", game.playBackgroundMusic);
+		if (typeof backgroundMusic === "function") {
+			const result = backgroundMusic(state);
+			// 旧版包体的处理器会移除续播监听，调用后也要恢复；重复添加相同监听不会叠加。
+			if (lib.config.disable_easter_egg_music) audio.addEventListener("ended", game.playBackgroundMusic);
+			return result;
+		}
 		audio.pause();
 		audio.loop = !!state.loop;
 		audio.playbackRate = state.rate > 0 ? state.rate : 1;
