@@ -43,5 +43,36 @@ export function installReplayPresentation(): boolean {
 	};
 	for (const name of ["die", "setIdentity", "showIdentity", "identityText", "identityColor"]) wrap(name);
 	for (const player of Object.values(game.playerMap || {})) showDeathIdentity(player);
+
+	// 旧录像只保存五谷弹窗标题；用真实 drawCard 事件中的卡牌 ID 恢复选牌者，不从标题猜测。
+	const cardDialog = game.videoContent.cardDialog;
+	if (typeof cardDialog === "function")
+		game.videoContent.cardDialog = function (content: any) {
+			const result = cardDialog.call(this, content);
+			if (Array.isArray(content) && content[0] === (lib.translate.wugu || "五谷丰登")) {
+				const dialog = ui.dialogs?.find((item: any) => item.videoId === content[2]);
+				if (dialog) dialog.__exporterDraft = true;
+			}
+			return result;
+		};
+	const drawCard = game.videoContent.drawCard;
+	if (typeof drawCard === "function")
+		game.videoContent.drawCard = function (player: any, cards: any) {
+			const result = drawCard.call(this, player, cards);
+			if (!player?.getName || !Array.isArray(cards)) return result;
+			for (const dialog of ui.dialogs || []) {
+				if (!dialog.__exporterDraft || !Array.isArray(dialog.buttons)) continue;
+				for (const info of cards) {
+					const id = info?.[4];
+					if (id == null) continue;
+					const index = dialog.buttons.findIndex((button: any) => String(button.link?.cardid) === String(id));
+					if (index < 0) continue;
+					const button = dialog.buttons[index];
+					game.createButtonCardsetion(player.getName(true), button);
+					dialog.buttons.splice(index, 1);
+				}
+			}
+			return result;
+		};
 	return true;
 }

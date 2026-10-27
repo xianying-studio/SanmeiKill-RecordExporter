@@ -63,3 +63,25 @@ test("非回放页面不安装展示适配", () => {
 	assert.equal(installReplayPresentation(), false);
 	assert.equal(f.created(), 0);
 });
+
+test("五谷丰登按录像卡牌 ID 标注选牌角色，重名卡牌不会混淆", () => {
+	const f = fixture();
+	const first = { link: { cardid: "card-1" } };
+	const second = { link: { cardid: "card-2" } };
+	const dialog = { videoId: 4, buttons: [first, second] };
+	window.ui.dialogs = [dialog];
+	f.game.videoContent.cardDialog = () => 17;
+	f.game.videoContent.drawCard = () => 23;
+	f.game.createButtonCardsetion = (name, button) => {
+		button.label = name;
+	};
+	installReplayPresentation();
+	assert.equal(f.game.videoContent.cardDialog(["五谷丰登", [], 4]), 17);
+	const player = { getName: full => (full ? "泠無情" : "不应使用") };
+	assert.equal(f.game.videoContent.drawCard(player, [["diamond", 2, "shan", null, "card-2"]]), 23);
+	assert.equal(second.label, "泠無情");
+	assert.equal(first.label, undefined);
+	assert.deepEqual(dialog.buttons, [first]);
+	f.game.videoContent.drawCard(player, [["diamond", 2, "shan", null, "card-2"]]);
+	assert.deepEqual(dialog.buttons, [first]);
+});
