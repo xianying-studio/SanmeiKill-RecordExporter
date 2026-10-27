@@ -191,7 +191,6 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 
 	// 3. 离屏加载游戏、注入驱动脚本、压缩等待回放并逐帧编码为 MP4。
 	dlog("开始离屏录制, savePath=", savePath, "录像 payload 长度=", msg.payload.length, "等待压缩=", WAIT_COMPRESS);
-	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, WAIT_COMPRESS);
 	let localPackage: ReceivedPackage | undefined;
 	try {
 		if (msg.packageStream) {
@@ -200,12 +199,12 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 			conn.progress("package", 100);
 		}
 		const buffer = await renderWithQualityFallback(
-			({ width, height, fps }) =>
+			({ width, height, fps, zoomPercent }) =>
 				recordOffscreen({
 					gamePackage: localPackage?.gamePackage,
 					renderMode: process.env.EXPORTER_RENDER_MODE === "realtime" ? "realtime" : "frame",
 					url: payload.baseurl,
-					injectScript,
+					injectScript: buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, WAIT_COMPRESS, zoomPercent),
 					width,
 					height,
 					fps,

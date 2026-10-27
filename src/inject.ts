@@ -18,7 +18,7 @@
  *
  * 脚本每次页面加载后都会被重新注入，用 sessionStorage 哨兵区分「布置阶段」与「录制阶段」。
  */
-function injectBody(linkJson: string, dbName: string, configPrefix: string, speed: number): void {
+function injectBody(linkJson: string, dbName: string, configPrefix: string, speed: number, zoomPercent: number): void {
 	const w = window as any;
 	const PLAY_ARMED = "exporter_play_armed";
 	// 预热哨兵：第一次完整加载（含 JIT/SW 注册与资源缓存）完成后置位，再 reload 进入录制阶段，
@@ -471,6 +471,7 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 			configStore.put(link.mode, "mode");
 			configStore.put(true, "dev");
 			configStore.put("1x", "video_default_play_speed");
+			configStore.put(`${zoomPercent}%`, "ui_zoom");
 			tx.oncomplete = () => {
 				try {
 					localStorage.setItem(configPrefix + "playbackmode", link.mode);
@@ -547,6 +548,6 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
  * @param configPrefix 游戏配置前缀（如 noname_0.9_）
  * @param speed 录制倍速（游戏以此倍速回放，recorder 端 ×speed 还原为正常速度）
  */
-export function buildInjectScript(linkJson: string, dbName: string, configPrefix: string, speed: number): string {
-	return `(${injectBody.toString()})(${JSON.stringify(linkJson)}, ${JSON.stringify(dbName)}, ${JSON.stringify(configPrefix)}, ${JSON.stringify(speed)});`;
+export function buildInjectScript(linkJson: string, dbName: string, configPrefix: string, speed: number, zoomPercent = 100): string {
+	return `(${injectBody.toString()})(${JSON.stringify(linkJson)}, ${JSON.stringify(dbName)}, ${JSON.stringify(configPrefix)}, ${JSON.stringify(speed)}, ${JSON.stringify(zoomPercent)});`;
 }

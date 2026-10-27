@@ -10,7 +10,7 @@ test("默认 2K 120 FPS 成功时不重复导出", async () => {
 		return Buffer.from("video");
 	});
 	assert.equal(result.toString(), "video");
-	assert.deepEqual(attempts, [{ width: 2560, height: 1440, fps: 120 }]);
+	assert.deepEqual(attempts, [{ width: 2560, height: 1440, fps: 120, zoomPercent: 175 }]);
 });
 
 test("2K 120 FPS 失败并清理后，只以 1080p 60 FPS 重试", async () => {
@@ -37,7 +37,12 @@ test("2K 120 FPS 失败并清理后，只以 1080p 60 FPS 重试", async () => {
 		}
 	);
 	assert.equal(result.toString(), "60 FPS video");
-	assert.deepEqual(events, [{ width: 2560, height: 1440, fps: 120 }, "清理120", "回退", { width: 1920, height: 1080, fps: 60 }]);
+	assert.deepEqual(events, [
+		{ width: 2560, height: 1440, fps: 120, zoomPercent: 175 },
+		"清理120",
+		"回退",
+		{ width: 1920, height: 1080, fps: 60, zoomPercent: 150 },
+	]);
 });
 
 test("60 FPS 再次失败时透传错误，不继续重试", async () => {
@@ -52,8 +57,8 @@ test("60 FPS 再次失败时透传错误，不继续重试", async () => {
 		error => error === fallbackError
 	);
 	assert.deepEqual(attempts, [
-		{ width: 2560, height: 1440, fps: 120 },
-		{ width: 1920, height: 1080, fps: 60 },
+		{ width: 2560, height: 1440, fps: 120, zoomPercent: 175 },
+		{ width: 1920, height: 1080, fps: 60, zoomPercent: 150 },
 	]);
 });
 
@@ -78,7 +83,7 @@ test("开始前取消时不运行，120 FPS 过程中取消时不回退", async 
 		),
 		/用户取消/
 	);
-	assert.deepEqual(attempts, [{ width: 2560, height: 1440, fps: 120 }]);
+	assert.deepEqual(attempts, [{ width: 2560, height: 1440, fps: 120, zoomPercent: 175 }]);
 });
 
 test("无取消信号的 AbortError 也不会重试", async () => {

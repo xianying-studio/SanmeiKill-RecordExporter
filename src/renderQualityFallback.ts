@@ -2,10 +2,11 @@ export interface RenderQuality {
 	readonly width: number;
 	readonly height: number;
 	readonly fps: number;
+	readonly zoomPercent: number;
 }
 
-export const DEFAULT_RENDER_QUALITY: RenderQuality = Object.freeze({ width: 2560, height: 1440, fps: 120 });
-export const FALLBACK_RENDER_QUALITY: RenderQuality = Object.freeze({ width: 1920, height: 1080, fps: 60 });
+export const DEFAULT_RENDER_QUALITY: RenderQuality = Object.freeze({ width: 2560, height: 1440, fps: 120, zoomPercent: 175 });
+export const FALLBACK_RENDER_QUALITY: RenderQuality = Object.freeze({ width: 1920, height: 1080, fps: 60, zoomPercent: 150 });
 
 interface RenderQualityFallbackOptions {
 	signal?: AbortSignal;
