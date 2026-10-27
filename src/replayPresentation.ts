@@ -6,20 +6,32 @@ export function installReplayPresentation(): boolean {
 	if (game.__exporterPresentationInstalled) return true;
 	game.__exporterPresentationInstalled = true;
 	// 新录像保存通用播放器状态，未来新增彩蛋也走同一回放入口。
-	if (typeof game.videoContent.backgroundMusic !== "function")
-		game.videoContent.backgroundMusic = (state: any) => {
-			const audio = ui.backgroundMusic;
-			if (!audio || !state || (state.easterEgg && lib.config.disable_easter_egg_music) || lib.config.background_music === "music_off") return;
-			audio.removeEventListener("ended", game.playBackgroundMusic);
-			audio.pause();
-			audio.loop = !!state.loop;
-			audio.playbackRate = state.rate > 0 ? state.rate : 1;
-			const src = state.src ? new URL(state.src, document.baseURI).href : "";
-			if (audio.src !== src) audio.src = src;
-			audio.currentTime = Math.max(0, state.offset || 0);
-			if (state.paused) audio.pause();
-			else if (src) game.resumeBackgroundMusic();
-		};
+	const backgroundMusic = game.videoContent.backgroundMusic;
+	game.videoContent.backgroundMusic = (state: any) => {
+		const audio = ui.backgroundMusic;
+		if (!audio || !state || (state.easterEgg && lib.config.disable_easter_egg_music) || lib.config.background_music === "music_off") return;
+		if (state.paused && lib.config.disable_easter_egg_music) {
+			for (let event = _status.event, depth = 0; event && depth < 50; event = event.parent, depth++) {
+				if (!Array.isArray(event.video)) continue;
+				for (const next of event.video) {
+					if (next.type !== "backgroundMusic" || next.delay > 0) break;
+					if (next.content?.easterEgg) return;
+					if (!next.content?.paused) break;
+				}
+				break;
+			}
+		}
+		if (typeof backgroundMusic === "function") return backgroundMusic(state);
+		audio.removeEventListener("ended", game.playBackgroundMusic);
+		audio.pause();
+		audio.loop = !!state.loop;
+		audio.playbackRate = state.rate > 0 ? state.rate : 1;
+		const src = state.src ? new URL(state.src, document.baseURI).href : "";
+		if (audio.src !== src) audio.src = src;
+		audio.currentTime = Math.max(0, state.offset || 0);
+		if (state.paused) audio.pause();
+		else if (src) game.resumeBackgroundMusic();
+	};
 	if (!w.__exporterHasMusicEvents) {
 		const enabled = () => ui.backgroundMusic && !lib.config.disable_easter_egg_music && lib.config.background_music !== "music_off";
 		const fullscreenpop = game.videoContent.fullscreenpop;

@@ -121,3 +121,53 @@ test("旧录像恢复洛克曲目排队，禁用时不调度", () => {
 	window.ui.backgroundMusic.dispatchEvent(new Event("ended"));
 	assert.equal(window._status.tempMusic, undefined);
 });
+
+test("禁用彩蛋时跳过切换前的暂停和 loop 状态，普通音乐持续播放", () => {
+	for (const nativeHandler of [false, true]) {
+		const f = fixture();
+		const audio = new EventTarget();
+		Object.assign(audio, {
+			src: "https://game.test/normal.mp3",
+			currentTime: 12,
+			paused: false,
+			loop: true,
+			playbackRate: 1,
+			pause() {
+				this.paused = true;
+			},
+		});
+		window.ui.backgroundMusic = audio;
+		window.lib.config.disable_easter_egg_music = true;
+		window.lib.config.background_music = "music_default";
+		f.game.resumeBackgroundMusic = () => {
+			audio.paused = false;
+		};
+		if (nativeHandler)
+			f.game.videoContent.backgroundMusic = state => {
+				audio.paused = state.paused;
+			};
+		installReplayPresentation();
+		const normal = { src: audio.src, offset: 12, paused: true, loop: false, rate: 1, easterEgg: false };
+		const egg = { ...normal, src: "https://game.test/extension/SanmeiKill/audio/background/laoda/zhuiji.mp3", paused: false, easterEgg: true };
+		window._status.event = {
+			parent: {
+				video: [
+					{ type: "backgroundMusic", delay: 0, content: normal },
+					{ type: "backgroundMusic", delay: 0, content: egg },
+				],
+			},
+		};
+		f.game.videoContent.backgroundMusic(normal);
+		window._status.event.parent.video.shift();
+		f.game.videoContent.backgroundMusic(normal);
+		window._status.event.parent.video.shift();
+		f.game.videoContent.backgroundMusic(egg);
+		assert.equal(audio.paused, false);
+		assert.equal(audio.currentTime, 12);
+		assert.equal(audio.loop, true);
+		// 真正独立的暂停必须保留，不能因之后才发生的彩蛋而恢复播放。
+		window._status.event.parent.video = [{ type: "backgroundMusic", delay: 1500, content: egg }];
+		f.game.videoContent.backgroundMusic(normal);
+		assert.equal(audio.paused, true);
+	}
+});
