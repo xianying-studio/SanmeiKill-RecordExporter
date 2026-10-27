@@ -34,7 +34,7 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 
 	function notify(m: any): void {
 		try {
-			w.__exporter && w.__exporter.notify(m);
+			w.__exporter && w.__exporter.notify({ ...m, time: w.__replayClock?.active ? w.__replayClock.now() / 1000 : undefined });
 		} catch {
 			/* ignore */
 		}
@@ -251,8 +251,7 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 			if (!document.getElementById("exporter-splash-style")) {
 				const st = document.createElement("style");
 				st.id = "exporter-splash-style";
-				st.textContent =
-					"#loading-screen .progress-container,#loading-screen .filename,#loading-screen .start-btn{display:none !important;}";
+				st.textContent = "#loading-screen .progress-container,#loading-screen .filename,#loading-screen .start-btn{display:none !important;}";
 				(document.head || document.documentElement).appendChild(st);
 			}
 		} catch {
@@ -298,6 +297,7 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 				return;
 			}
 			started = true;
+			w.__replayClock?.start();
 			// 隐藏顶部回放控制条（#system）。用 !important 规则，避免被回放初始化 show() 盖回。
 			try {
 				if (!document.getElementById("exporter-hide-ui-style")) {
@@ -325,12 +325,15 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 		}
 
 		// 4. 兜底：若某些环境下 LOADING_FADE_EVENT 未触发，用 _status.video 作为后备触发开始录制。
-		const fallbackStart = setTimeout(() => {
-			if (!started) {
-				window.removeEventListener(LOADING_FADE_EVENT, onLoadingFade);
-				beginRecording();
-			}
-		}, 30000);
+		const fallbackStart = setTimeout(
+			() => {
+				if (!started) {
+					window.removeEventListener(LOADING_FADE_EVENT, onLoadingFade);
+					notify({ type: "error", message: "等待游戏回放就绪超时" });
+				}
+			},
+			10 * 60 * 1000
+		);
 
 		// 5. 进度采集与结束判定。
 		const iv = setInterval(() => {
@@ -398,6 +401,10 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 		const armAndReload = () => {
 			try {
 				stopCachePoll();
+				// 预热时模式初始化可能已经消费 playback，录制重载前须重新布置。
+				const record = JSON.parse(linkJson);
+				localStorage.setItem(configPrefix + "playbackmode", record.mode);
+				localStorage.setItem(configPrefix + "playback", String(record.time));
 				sessionStorage.setItem(PLAY_ARMED, "1");
 				sessionStorage.removeItem(WARMED);
 				location.reload();
@@ -407,16 +414,21 @@ function injectBody(linkJson: string, dbName: string, configPrefix: string, spee
 		};
 		// 游戏就绪（派发淡出事件）后即 reload 进入录制；兜底超时同样 reload，避免卡死。
 		const fade = () => {
+			clearTimeout(warmTimeout);
 			window.removeEventListener(LOADING_FADE_EVENT, fade);
 			armAndReload();
 		};
 		window.addEventListener(LOADING_FADE_EVENT, fade);
-		setTimeout(() => {
-			window.removeEventListener(LOADING_FADE_EVENT, fade);
-			if (!sessionStorage.getItem(PLAY_ARMED)) {
-				armAndReload();
-			}
-		}, 30000);
+		const warmTimeout = setTimeout(
+			() => {
+				window.removeEventListener(LOADING_FADE_EVENT, fade);
+				if (!sessionStorage.getItem(PLAY_ARMED)) {
+					stopCachePoll();
+					notify({ type: "error", message: "等待生产资源缓存预热超时" });
+				}
+			},
+			10 * 60 * 1000
+		);
 		return;
 	}
 

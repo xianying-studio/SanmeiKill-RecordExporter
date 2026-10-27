@@ -205,6 +205,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		}
 		const buffer = await recordOffscreen({
 			gamePackage: localPackage?.gamePackage,
+			renderMode: process.env.EXPORTER_RENDER_MODE === "realtime" ? "realtime" : "frame",
 			url: payload.baseurl,
 			injectScript,
 			width: RECORD_WIDTH,

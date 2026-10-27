@@ -11,6 +11,7 @@ export interface VideoMessage {
 	filename?: string;
 	/** 新网页端可直接流式传输当前缓存中的 .smk 包体。 */
 	packageStream?: boolean;
+	renderMode?: "realtime" | "frame";
 }
 
 /** 工具 → 网页端：进度。 */

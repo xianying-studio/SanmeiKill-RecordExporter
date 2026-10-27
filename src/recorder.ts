@@ -5,6 +5,7 @@ import { EncoderWindow } from "./encoder/encoderWindow";
 import { dlog } from "./debugLog";
 import { CapturedFrame } from "./capturedFrame";
 import type { GamePackage } from "./gamePackage";
+import { buildReplayClockScript } from "./replayClock";
 
 /** 录制参数。 */
 export interface RecordOptions {
@@ -33,6 +34,7 @@ export interface RecordOptions {
 	/** auto 优先使用 Windows/macOS 的 GPU 共享纹理；bitmap 保留兼容路径。 */
 	frameTransport?: "auto" | "shared-texture" | "bitmap";
 	gamePackage?: GamePackage;
+	renderMode?: "realtime" | "frame";
 }
 
 /** 来自注入脚本的回报消息类型。 */
@@ -43,6 +45,7 @@ interface NotifyMessage {
 	url?: string;
 	loop?: boolean;
 	data?: Uint8Array;
+	time?: number;
 }
 
 /** 一条音频播放事件（视频时间戳由 recorder 端统一时钟打戳）。 */
@@ -112,6 +115,8 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 		let repaintTimer: NodeJS.Timeout | null = null;
 		let lastPaintAt = 0; // 最近一次 paint 的墙钟时刻（ms），供补帧泵判断是否需要补帧
 		let outputTimer: NodeJS.Timeout | null = null;
+		let manualRunning = false;
+		const manual = opts.renderMode === "frame";
 
 		// —— CFR 输出泵：把「抖动/漏帧的 paint 采集节奏」与「恒定的视频帧率」彻底解耦 ——
 		// 背景：Electron 离屏渲染（OSR）的 paint 事件节奏不可控（macOS 上 GPU→CPU 回读开销大，
@@ -184,6 +189,27 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 			void pending.catch(error => fail(error)).finally(() => pendingFrames.delete(pending));
 			frameCount++;
 			return true;
+		};
+
+		const startManualLoop = async () => {
+			if (!manual || manualRunning || !capturing || !inited || !latestFrame) return;
+			manualRunning = true;
+			try {
+				for (let index = 0; !settled; index++) {
+					if (!offscreen || offscreen.isDestroyed()) return;
+					const timestamp = index / effectiveFps;
+					await offscreen.webContents.executeJavaScript(`window.__replayClock.advance(${timestamp * 1000})`);
+					await new Promise<void>(resolve => setImmediate(resolve));
+					if (settled || !latestFrame) return;
+					lastVideoTs = timestamp;
+					await latestFrame.send(encoder, timestamp);
+					frameCount++;
+					if (!capturing) break;
+				}
+				if (!settled) finishEncoding();
+			} catch (error) {
+				fail(error instanceof Error ? error : new Error(String(error)));
+			}
 		};
 
 		// 「补帧泵」：Electron 离屏渲染默认只在脏矩形变化时出 paint，静止画面（牌桌/角色/手牌不动）
@@ -302,7 +328,7 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 			// 收集音频播放事件：用 recorder 统一时钟打戳（真实墙钟时间），与帧同源。
 			if (msg?.type === "audio-event") {
 				if (msg.url && startTime > 0) {
-					const t = Math.max(0, (Date.now() - startTime) / 1000);
+					const t = manual && typeof msg.time === "number" ? msg.time : Math.max(0, (Date.now() - startTime) / 1000);
 					audioEvents.push({ t, url: msg.url, loop: !!msg.loop });
 					dlog("audio-event t=", t.toFixed(2), "loop=", !!msg.loop, "url=", String(msg.url).slice(-48));
 				}
@@ -326,6 +352,11 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 					// 启动「强制全屏重绘」泵：Electron 离屏渲染默认只把「脏矩形」刷进 paint 位图，
 					// 静止时牌桌/角色/手牌区域不被重绘 → 捕获帧里只剩背景与刚变化的 UI（角色像「消失」），
 					// 唯有觉醒等全屏特效强制整屏重绘时才完整出现。周期性 invalidate() 强制每帧整屏重绘，根治该问题。
+					if (manual) {
+						offscreen?.webContents.setFrameRate(useSharedTexture ? 1000 : 240);
+						void startManualLoop();
+						break;
+					}
 					startRepaintPump();
 					// 启动 CFR 输出泵：以恒定 1/fps 节奏从「最近一帧」缓存产帧，与采集节奏解耦。
 					lastDiagMs = startTime;
@@ -336,7 +367,7 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 					break;
 				case "over":
 					capturing = false;
-					finishEncoding();
+					if (!manual) finishEncoding();
 					break;
 				case "error":
 					fail(new Error("注入脚本错误：" + (msg.message || "未知")));
@@ -368,7 +399,8 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 					try {
 						const ctrl = new AbortController();
 						const to = setTimeout(() => ctrl.abort(), 5000);
-						const res = await fetch(url, { signal: ctrl.signal });
+						const res = opts.gamePackage ? opts.gamePackage.response(new Request(url)) : await fetch(url, { signal: ctrl.signal });
+						if (!res.ok) throw new Error("音频资源不可用：" + url);
 						const ab = await res.arrayBuffer();
 						clearTimeout(to);
 						audioFiles[url] = new Uint8Array(ab);
@@ -378,7 +410,7 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 				}
 				// 总时长用最后一帧时间戳（音频不应超过视频长度）。
 				dlog("收尾：交付音频给编码器并 finish，视频时长=", lastVideoTs.toFixed(2), "s，总帧=", frameCount);
-				encoder.setAudio(audioEvents, audioFiles, lastVideoTs);
+				encoder.setAudio(audioEvents, audioFiles, lastVideoTs + 1 / effectiveFps);
 			} catch (e) {
 				dlog("准备音频失败:", String(e));
 			}
@@ -401,7 +433,7 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 				clearTimeout(timer);
 				timer = null;
 			}
-			if (!capturing || settled) {
+			if ((!capturing && !manual) || settled) {
 				e.texture?.release();
 				return;
 			}
@@ -412,24 +444,6 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 				e.texture?.release();
 				return;
 			}
-			if (!inited) {
-				e.texture?.release();
-				if (initing) {
-					return;
-				}
-				initing = true;
-				encoder
-					.init(size.width, size.height, effectiveFps, opts.bitrate)
-					.then(() => {
-						inited = true;
-					})
-					.catch(err => fail(err instanceof Error ? err : new Error(String(err))));
-				return;
-			}
-			// paint 只更新「最近一帧」缓存（不在此编码）：采集节奏由 OSR 决定、不可控且会抖动/漏帧；
-			// 真正的视频帧由 CFR 输出泵以恒定 1/fps 节奏从此缓存产出，彻底消除帧率不稳。
-			// 必须拷贝：getBitmap() 返回的 Buffer 不复制底层内存，仅在当前 tick 内有效，下次 paint 即被覆写/销毁；
-			// 而本缓存要跨 tick 供输出泵反复读取，故 Buffer.from 复制一份持有。
 			try {
 				const nextFrame = e.texture ? CapturedFrame.fromTexture(e.texture) : CapturedFrame.fromBitmap(image);
 				latestFrame?.release();
@@ -438,6 +452,20 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 				fail(new Error("共享纹理不可用：" + String(error)));
 			}
 			paintCount++;
+			if (!inited) {
+				if (initing) {
+					return;
+				}
+				initing = true;
+				encoder
+					.init(size.width, size.height, effectiveFps, opts.bitrate)
+					.then(() => {
+						inited = true;
+						void startManualLoop();
+					})
+					.catch(err => fail(err instanceof Error ? err : new Error(String(err))));
+				return;
+			}
 		};
 
 		ipcMain.on("offscreen:notify", onNotify);
@@ -456,7 +484,7 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 
 		encoder
 			.open()
-			.then(() => {
+			.then(async () => {
 				offscreen = new BrowserWindow({
 					show: false,
 					width: opts.width,
@@ -471,6 +499,15 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 					},
 				});
 				offscreen.webContents.setFrameRate(opts.fps);
+				if (manual) {
+					await offscreen.loadURL("about:blank");
+					offscreen.webContents.debugger.attach("1.3");
+					await offscreen.webContents.debugger.sendCommand("Page.enable");
+					offscreen.webContents.debugger.on("message", (_event, method, parameters) => {
+						if (method === "Runtime.exceptionThrown") opts.onLog?.("回放页异常：" + JSON.stringify(parameters.exceptionDetails));
+					});
+					await offscreen.webContents.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", { source: buildReplayClockScript() });
+				}
 				if (useSharedTexture) {
 					timer = setTimeout(() => fail(new Error("共享纹理不可用：等待 GPU 帧超时")), 15000);
 				}
@@ -504,7 +541,10 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 						.then(() => offscreen?.webContents.executeJavaScript(opts.injectScript))
 						.catch(err => fail(err instanceof Error ? err : new Error(String(err))));
 				});
-				return offscreen.loadURL(opts.url);
+				return offscreen.loadURL(opts.url).catch(error => {
+					// PWA 首次安装 Service Worker 时会主动重载；由后续 did-finish-load 继续布置回放。
+					if (error?.code !== "ERR_ABORTED") throw error;
+				});
 			})
 			.catch(err => fail(err instanceof Error ? err : new Error(String(err))));
 	});
