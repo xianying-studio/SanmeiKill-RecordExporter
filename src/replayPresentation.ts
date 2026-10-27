@@ -7,6 +7,7 @@ export function installReplayPresentation(): boolean {
 	game.__exporterPresentationInstalled = true;
 	// 新录像保存通用播放器状态，未来新增彩蛋也走同一回放入口。
 	const backgroundMusic = game.videoContent.backgroundMusic;
+	const packageMusic = /^(?:audio\/background\/|extension\/[^/]+\/audio\/background\/)/;
 	game.videoContent.backgroundMusic = (state: any) => {
 		const audio = ui.backgroundMusic;
 		if (!audio || !state || (state.easterEgg && lib.config.disable_easter_egg_music) || lib.config.background_music === "music_off") return;
@@ -20,6 +21,16 @@ export function installReplayPresentation(): boolean {
 				}
 				break;
 			}
+		}
+		if (state.src && state.builtin !== false) {
+			let assetPath = state.src.replace(/^(?:\.\/|\/)/, "");
+			// 早期录像中的彩蛋存为绝对地址；按包内路径迁移，不向录制站点回源。
+			if (!packageMusic.test(assetPath) && (state.builtin || state.easterEgg)) {
+				const url = new URL(state.src, document.baseURI);
+				const match = url.pathname.match(/(?:^|\/)((?:audio\/background|extension\/[^/]+\/audio\/background)\/.+)$/);
+				if (match) assetPath = match[1] + url.search + url.hash;
+			}
+			if (packageMusic.test(assetPath)) state = { ...state, src: new URL(assetPath, new URL(lib.assetURL || "./", document.baseURI)).href };
 		}
 		if (typeof backgroundMusic === "function") return backgroundMusic(state);
 		audio.removeEventListener("ended", game.playBackgroundMusic);

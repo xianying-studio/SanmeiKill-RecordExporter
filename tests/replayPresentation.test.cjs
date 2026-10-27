@@ -171,3 +171,40 @@ test("禁用彩蛋时跳过切换前的暂停和 loop 状态，普通音乐持�
 		assert.equal(audio.paused, true);
 	}
 });
+
+test("内置音乐按当前部署资源根路径重定位，自定义外部地址保持原样", () => {
+	for (const nativeHandler of [false, true]) {
+		const f = fixture();
+		const audio = new EventTarget();
+		Object.assign(audio, {
+			src: "",
+			paused: true,
+			pause() {
+				this.paused = true;
+			},
+		});
+		window.ui.backgroundMusic = audio;
+		window.lib.assetURL = "https://local.test/deploy/assets/";
+		global.document = { baseURI: "https://local.test/deploy/" };
+		f.game.resumeBackgroundMusic = () => {
+			audio.paused = false;
+		};
+		if (nativeHandler)
+			f.game.videoContent.backgroundMusic = state => {
+				audio.src = state.src;
+			};
+		installReplayPresentation();
+		const state = { offset: 0, paused: false, loop: false, rate: 1, easterEgg: false };
+		f.game.videoContent.backgroundMusic({ ...state, src: "audio/background/music_default.mp3", builtin: true });
+		assert.equal(audio.src, "https://local.test/deploy/assets/audio/background/music_default.mp3");
+		f.game.videoContent.backgroundMusic({
+			...state,
+			src: "https://record.test/old/extension/SanmeiKill/audio/background/laoda/zhuiji.mp3",
+			easterEgg: true,
+		});
+		assert.equal(audio.src, "https://local.test/deploy/assets/extension/SanmeiKill/audio/background/laoda/zhuiji.mp3");
+		const external = "https://custom.test/extension/SanmeiKill/audio/background/custom.mp3";
+		f.game.videoContent.backgroundMusic({ ...state, src: external, builtin: false });
+		assert.equal(audio.src, external);
+	}
+});
