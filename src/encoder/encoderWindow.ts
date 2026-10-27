@@ -19,6 +19,9 @@ export class EncoderWindow {
 	private doneResolve: ((file: VideoFile) => void) | null = null;
 	private videoFile: VideoFile | null = null;
 	private writeChannel = "encoder:write:" + randomUUID();
+	private closed = false;
+	/** 同一视频保持导入顺序，不同编码进程可以同时导入纹理。 */
+	private sharedTransfer = Promise.resolve();
 	private failed: ((err: Error) => void) | null = null;
 	private rejected = false;
 	/** 帧专用通道（主进程侧端口）；帧经此 postMessage 投送到编码器主世界。 */
@@ -41,7 +44,12 @@ export class EncoderWindow {
 
 	/** 创建窗口并等待编码器就绪。 */
 	async open(): Promise<void> {
-		this.videoFile = await VideoFile.create();
+		const file = await VideoFile.create();
+		if (this.closed) {
+			await file.dispose();
+			throw new Error("编码器已取消");
+		}
+		this.videoFile = file;
 		this.win = new BrowserWindow({
 			show: false,
 			webPreferences: {
@@ -136,12 +144,12 @@ export class EncoderWindow {
 	}
 
 	/** 初始化编码参数（尺寸、帧率、码率），等待编码器准备好接收帧。 */
-	async init(width: number, height: number, fps: number, bitrate?: number): Promise<void> {
+	async init(width: number, height: number, fps: number, bitrate?: number, includeAudio = true): Promise<void> {
 		const inited = new Promise<void>((resolve, reject) => {
 			this.initedResolve = resolve;
 			this.failed = reject;
 		});
-		this.send({ type: "init", width, height, fps, bitrate, writeChannel: this.writeChannel });
+		this.send({ type: "init", width, height, fps, bitrate, includeAudio, writeChannel: this.writeChannel });
 		await inited;
 	}
 
@@ -155,9 +163,21 @@ export class EncoderWindow {
 
 	/** 只传纹理引用；像素不经过主进程的 Buffer 和跨进程位图复制。 */
 	pushSharedFrame(texture: Electron.SharedTextureImported, timestampSec: number): Promise<void> {
-		return this.submitFrame(async frameId => {
-			if (!this.win || this.win.isDestroyed()) throw new Error("编码器窗口已关闭");
-			await sharedTexture.sendSharedTexture({ frame: this.win.webContents.mainFrame, importedSharedTexture: texture }, timestampSec, frameId);
+		return this.submitFrame(frameId => {
+			const transfer = this.sharedTransfer.then(async () => {
+				if (!this.win || this.win.isDestroyed()) throw new Error("编码器窗口已关闭");
+				try {
+					await sharedTexture.sendSharedTexture(
+						{ frame: this.win.webContents.mainFrame, importedSharedTexture: texture },
+						timestampSec,
+						frameId
+					);
+				} catch (error) {
+					throw new Error("共享纹理不可用：" + String(error));
+				}
+			});
+			this.sharedTransfer = transfer.catch(() => {});
+			return transfer;
 		});
 	}
 
@@ -180,7 +200,11 @@ export class EncoderWindow {
 	 * @param files URL → 原始音频字节
 	 * @param totalDurationSec 视频总时长（音频不超过此长度）
 	 */
-	setAudio(events: Array<{ t: number; url: string; loop: boolean }>, files: Record<string, Uint8Array>, totalDurationSec: number): void {
+	setAudio(
+		events: Array<{ t: number; url: string; loop: boolean; offset?: number; rate?: number }>,
+		files: Record<string, Uint8Array>,
+		totalDurationSec: number
+	): void {
 		this.send({ type: "audio-data", events, files, totalDurationSec });
 	}
 
@@ -202,6 +226,7 @@ export class EncoderWindow {
 
 	/** 销毁窗口并解绑监听。 */
 	close(): void {
+		this.closed = true;
 		this.reject(new Error("编码器已关闭"));
 		ipcMain.removeHandler(this.writeChannel);
 		const file = this.videoFile;

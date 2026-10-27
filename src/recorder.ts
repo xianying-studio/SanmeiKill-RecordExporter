@@ -36,6 +36,20 @@ export interface RecordOptions {
 	frameTransport?: "auto" | "shared-texture" | "bitmap";
 	gamePackage?: GamePackage;
 	renderMode?: "realtime" | "frame";
+	/** 分段采用全局帧序号，结束位置不包含在本段内；最后一段自然结束。 */
+	segment?: { startFrame: number; endFrame?: number };
+	includeAudio?: boolean;
+	clock?: { seed: number; epoch: number };
+	onComplete?: (stats: RecordingStats) => void;
+	/** 并行任务在全部状态恢复后同时开始编码，避免快进和纹理传输争用 GPU。 */
+	beforeRender?: () => Promise<void>;
+}
+
+export interface RecordingStats {
+	startFrame: number;
+	endFrame: number;
+	frames: number;
+	rendererPid: number;
 }
 
 /** 来自注入脚本的回报消息类型。 */
@@ -47,6 +61,8 @@ interface NotifyMessage {
 	loop?: boolean;
 	data?: Uint8Array;
 	time?: number;
+	offset?: number;
+	rate?: number;
 }
 
 /** 一条音频播放事件（视频时间戳由 recorder 端统一时钟打戳）。 */
@@ -57,6 +73,8 @@ interface AudioEvent {
 	url: string;
 	/** 是否循环（BGM 为 true）。 */
 	loop: boolean;
+	offset?: number;
+	rate?: number;
 }
 
 /** WebSocket 断开时的取消原因（中止录制并清理后台残留窗口）。 */
@@ -96,6 +114,7 @@ async function renderToTemporaryFile(opts: RecordOptions): Promise<VideoFile> {
 	try {
 		return await recordAttempt(opts);
 	} catch (error) {
+		if (opts.signal?.aborted) throw error;
 		if (opts.frameTransport && opts.frameTransport !== "auto") throw error;
 		if (!(error instanceof Error) || !error.message.startsWith("共享纹理不可用：")) throw error;
 		opts.onLog?.(`${error.message}；切换位图兼容模式`);
@@ -104,6 +123,16 @@ async function renderToTemporaryFile(opts: RecordOptions): Promise<VideoFile> {
 }
 
 function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
+	const firstFrame = opts.segment?.startFrame ?? 0;
+	const endFrame = opts.segment?.endFrame ?? Infinity;
+	if (
+		!Number.isSafeInteger(firstFrame) ||
+		firstFrame < 0 ||
+		(endFrame !== Infinity && (!Number.isSafeInteger(endFrame) || endFrame <= firstFrame))
+	) {
+		return Promise.reject(new Error("录像分段范围无效"));
+	}
+	if (opts.segment && opts.renderMode !== "frame") return Promise.reject(new Error("分段导出需要逐帧模式"));
 	return new Promise<VideoFile>((resolve, reject) => {
 		const useSharedTexture = opts.frameTransport !== "bitmap" && (process.platform === "win32" || process.platform === "darwin");
 		const pendingFrames = new Set<Promise<void>>();
@@ -113,7 +142,12 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 			for (const scheme of ["http", "https"])
 				replaySession.protocol.handle(scheme, request => {
 					if (new URL(request.url).origin !== origin) return new Response("导出包体不允许外部网络请求", { status: 403 });
-					return opts.gamePackage!.response(request);
+					try {
+						return opts.gamePackage!.response(request);
+					} catch (error) {
+						opts.onLog?.("包体资源读取失败：" + request.url + " " + String(error));
+						throw error;
+					}
 				});
 		}
 		const speed = opts.speed && opts.speed >= 1 ? opts.speed : 1;
@@ -138,6 +172,8 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 		let lastPaintAt = 0; // 最近一次 paint 的墙钟时刻（ms），供补帧泵判断是否需要补帧
 		let outputTimer: NodeJS.Timeout | null = null;
 		let manualRunning = false;
+		let advanceMilliseconds = 0;
+		let frameQueueMilliseconds = 0;
 		const manual = opts.renderMode === "frame";
 
 		// —— CFR 输出泵：把「抖动/漏帧的 paint 采集节奏」与「恒定的视频帧率」彻底解耦 ——
@@ -217,15 +253,32 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 			if (!manual || manualRunning || !capturing || !inited || !latestFrame) return;
 			manualRunning = true;
 			try {
-				for (let index = 0; !settled; index++) {
+				if (opts.beforeRender) offscreen?.webContents.stopPainting();
+				if (firstFrame > 0 && offscreen) {
+					opts.onLog?.(`快速恢复至第 ${firstFrame} 帧`);
+					offscreen.webContents.stopPainting();
+					await offscreen.webContents.executeJavaScript(`window.__replayClock.seekFrame(${firstFrame}, ${effectiveFps})`);
+					if (settled || !offscreen || offscreen.isDestroyed()) return;
+					if (!opts.beforeRender) offscreen.webContents.startPainting();
+					opts.onLog?.(`分段状态恢复完成，第 ${firstFrame} 帧开始渲染`);
+				}
+				if (opts.beforeRender) {
+					await opts.beforeRender();
+					if (settled || !offscreen || offscreen.isDestroyed()) return;
+					offscreen.webContents.startPainting();
+				}
+				for (let index = firstFrame; !settled && index < endFrame; index++) {
 					if (!offscreen || offscreen.isDestroyed()) return;
 					const timestamp = index / effectiveFps;
+					const advanceStarted = performance.now();
 					await offscreen.webContents.executeJavaScript(`window.__replayClock.advance(${timestamp * 1000})`);
+					advanceMilliseconds += performance.now() - advanceStarted;
 					await new Promise<void>(resolve => setImmediate(resolve));
 					if (settled || !latestFrame) return;
 					lastVideoTs = timestamp;
+					const queueStarted = performance.now();
 					// 最多两帧在途，允许编码上一帧时合成下一帧，同时限制 GPU 纹理占用。
-					const pending = latestFrame.send(encoder, timestamp);
+					const pending = latestFrame.send(encoder, (index - firstFrame) / effectiveFps);
 					pendingFrames.add(pending);
 					void pending.then(
 						() => pendingFrames.delete(pending),
@@ -236,6 +289,7 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 					);
 					frameCount++;
 					if (pendingFrames.size >= 2) await Promise.race(pendingFrames);
+					frameQueueMilliseconds += performance.now() - queueStarted;
 					if (!capturing) break;
 				}
 				if (!settled) finishEncoding();
@@ -321,11 +375,15 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 				return;
 			}
 			settled = true;
+			if (!opts.signal?.aborted) opts.onLog?.("录制失败源：" + (err.stack || String(err)));
 			cleanup();
 			reject(err);
 		};
 
-		const onAbort = () => fail(new Error(ABORT_REASON));
+		const onAbort = () => {
+			const reason = opts.signal?.reason;
+			fail(reason instanceof Error ? reason : Object.assign(new Error(ABORT_REASON), { name: "AbortError" }));
+		};
 
 		// 编码器任意阶段报错（含录制中途）：记录并结束流程，避免被吞掉导致静默卡死。
 		encoder.onError = err => {
@@ -339,6 +397,16 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 				return;
 			}
 			settled = true;
+			if (manual && frameCount)
+				opts.onLog?.(
+					`逐帧耗时：画面推进平均 ${(advanceMilliseconds / frameCount).toFixed(3)}ms，编码等待平均 ${(frameQueueMilliseconds / frameCount).toFixed(3)}ms`
+				);
+			opts.onComplete?.({
+				startFrame: firstFrame,
+				endFrame: firstFrame + frameCount,
+				frames: frameCount,
+				rendererPid: offscreen?.webContents.getOSProcessId() ?? 0,
+			});
 			cleanup();
 			resolve(file);
 		};
@@ -353,16 +421,17 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 			}
 			// 收集音频文件原始字节（按 URL 去重，离屏端已去重，这里再兜底）。
 			if (msg?.type === "audio-file") {
-				if (msg.url && msg.data) {
+				if (opts.includeAudio !== false && msg.url && msg.data) {
 					audioFiles[msg.url] = msg.data;
 				}
 				return;
 			}
 			// 收集音频播放事件：用 recorder 统一时钟打戳（真实墙钟时间），与帧同源。
 			if (msg?.type === "audio-event") {
-				if (msg.url && startTime > 0) {
+				if (opts.includeAudio !== false && typeof msg.url === "string" && (msg.url || msg.loop) && startTime > 0) {
 					const t = manual && typeof msg.time === "number" ? msg.time : Math.max(0, (Date.now() - startTime) / 1000);
-					audioEvents.push({ t, url: msg.url, loop: !!msg.loop });
+					audioEvents.push({ t, url: msg.url, loop: !!msg.loop, offset: msg.offset, rate: msg.rate });
+					if (msg.loop) opts.onLog?.(`BGM ${t.toFixed(3)}s ${msg.url || "暂停"}`);
 					dlog("audio-event t=", t.toFixed(2), "loop=", !!msg.loop, "url=", String(msg.url).slice(-48));
 				}
 				return;
@@ -378,6 +447,7 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 					opts.onStage?.("cache", typeof msg.percent === "number" ? msg.percent : 0);
 					break;
 				case "recording-start":
+					opts.onLog?.(`游戏渲染进程 PID=${offscreen?.webContents.getOSProcessId()}`);
 					capturing = true;
 					// 统一时钟基准：帧与音频事件都以此刻为 0。
 					startTime = Date.now();
@@ -423,7 +493,7 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 				await Promise.all(pendingFrames);
 				const needed = new Set<string>();
 				for (const ev of audioEvents) {
-					if (!audioFiles[ev.url] && !ev.url.startsWith("blob:")) {
+					if (ev.url && !audioFiles[ev.url] && !ev.url.startsWith("blob:")) {
 						needed.add(ev.url);
 					}
 				}
@@ -458,6 +528,11 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 			_dirty: Electron.Rectangle,
 			image: Electron.NativeImage
 		) => {
+			// 预热只需一帧初始化编码器；反复复制 2K 位图会占满主进程，阻塞多个页面的资源加载。
+			if (manual && !capturing && (inited || initing)) {
+				e.texture?.release();
+				return;
+			}
 			if (useSharedTexture && !e.texture) {
 				// invalidate() 可能额外产生无纹理的 paint；它不表示正常 GPU 帧流已经失效。
 				return;
@@ -491,7 +566,7 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 				}
 				initing = true;
 				encoder
-					.init(size.width, size.height, effectiveFps, opts.bitrate)
+					.init(size.width, size.height, effectiveFps, opts.bitrate, opts.includeAudio !== false)
 					.then(() => {
 						inited = true;
 						void startManualLoop();
@@ -518,6 +593,7 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 		encoder
 			.open()
 			.then(async () => {
+				if (settled) return;
 				offscreen = new BrowserWindow({
 					show: false,
 					width: opts.width,
@@ -531,7 +607,7 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 						backgroundThrottling: false,
 					},
 				});
-				offscreen.webContents.setFrameRate(opts.fps);
+				offscreen.webContents.setFrameRate(manual ? 30 : opts.fps);
 				if (manual) {
 					await offscreen.loadURL("about:blank");
 					offscreen.webContents.debugger.attach("1.3");
@@ -539,7 +615,9 @@ function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
 					offscreen.webContents.debugger.on("message", (_event, method, parameters) => {
 						if (method === "Runtime.exceptionThrown") opts.onLog?.("回放页异常：" + JSON.stringify(parameters.exceptionDetails));
 					});
-					await offscreen.webContents.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", { source: buildReplayClockScript() });
+					await offscreen.webContents.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
+						source: buildReplayClockScript(opts.clock),
+					});
 				}
 				if (useSharedTexture) {
 					timer = setTimeout(() => fail(new Error("共享纹理不可用：等待 GPU 帧超时")), 15000);

@@ -85,3 +85,39 @@ test("五谷丰登按录像卡牌 ID 标注选牌角色，重名卡牌不会混�
 	f.game.videoContent.drawCard(player, [["diamond", 2, "shan", null, "card-2"]]);
 	assert.deepEqual(dialog.buttons, [first]);
 });
+
+test("旧录像恢复坠机音乐，并尊重禁用彩蛋音乐开关", () => {
+	const f = fixture();
+	const audio = new EventTarget();
+	Object.assign(audio, { src: "https://game.test/normal.mp3", loop: true, playbackRate: 1, pause() {} });
+	window.ui.backgroundMusic = audio;
+	window.lib.config.background_music = "music_random";
+	window.lib.config.disable_easter_egg_music = true;
+	f.game.videoContent.fullscreenpop = () => 31;
+	f.game.resumeBackgroundMusic = () => {};
+	global.document = { baseURI: "https://game.test/" };
+	installReplayPresentation();
+	assert.equal(f.game.videoContent.fullscreenpop(f.player, ["坠机"]), 31);
+	assert.equal(audio.src, "https://game.test/normal.mp3");
+	window.lib.config.disable_easter_egg_music = false;
+	f.game.videoContent.fullscreenpop(f.player, ["坠机"]);
+	assert.match(audio.src, /laoda\/zhuiji\.mp3$/);
+	audio.dispatchEvent(new Event("ended"));
+	assert.equal(audio.src, "https://game.test/normal.mp3");
+});
+
+test("旧录像恢复洛克曲目排队，禁用时不调度", () => {
+	const f = fixture();
+	window.ui.backgroundMusic = new EventTarget();
+	f.game.players = [{ name: "sanmei_luoke" }];
+	window.lib.config.background_music = "music_random";
+	window.lib.config.disable_easter_egg_music = true;
+	installReplayPresentation();
+	window.__exporterStartReplayMusic();
+	assert.equal(window._status.tempMusic, undefined);
+	window.lib.config.disable_easter_egg_music = false;
+	window.__exporterStartReplayMusic();
+	assert.match(window._status.tempMusic, /luoke\/battle[123]\.mp3$/);
+	window.ui.backgroundMusic.dispatchEvent(new Event("ended"));
+	assert.equal(window._status.tempMusic, undefined);
+});

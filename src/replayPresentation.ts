@@ -5,6 +5,82 @@ export function installReplayPresentation(): boolean {
 	if (!game?.videoContent || !lib?.config || !ui?.arena || !_status?.video) return false;
 	if (game.__exporterPresentationInstalled) return true;
 	game.__exporterPresentationInstalled = true;
+	// 新录像保存通用播放器状态，未来新增彩蛋也走同一回放入口。
+	if (typeof game.videoContent.backgroundMusic !== "function")
+		game.videoContent.backgroundMusic = (state: any) => {
+			const audio = ui.backgroundMusic;
+			if (!audio || !state || (state.easterEgg && lib.config.disable_easter_egg_music) || lib.config.background_music === "music_off") return;
+			audio.removeEventListener("ended", game.playBackgroundMusic);
+			audio.pause();
+			audio.loop = !!state.loop;
+			audio.playbackRate = state.rate > 0 ? state.rate : 1;
+			const src = state.src ? new URL(state.src, document.baseURI).href : "";
+			if (audio.src !== src) audio.src = src;
+			audio.currentTime = Math.max(0, state.offset || 0);
+			if (state.paused) audio.pause();
+			else if (src) game.resumeBackgroundMusic();
+		};
+	if (!w.__exporterHasMusicEvents) {
+		const enabled = () => ui.backgroundMusic && !lib.config.disable_easter_egg_music && lib.config.background_music !== "music_off";
+		const fullscreenpop = game.videoContent.fullscreenpop;
+		if (typeof fullscreenpop === "function")
+			game.videoContent.fullscreenpop = function (player: any, content: any) {
+				const result = fullscreenpop.call(this, player, content);
+				if (content?.[0] !== (lib.translate.sanmei_zhuiji || "坠机") || !enabled()) return result;
+				const audio = ui.backgroundMusic;
+				const src = new URL(`${lib.assetURL || ""}extension/SanmeiKill/audio/background/laoda/zhuiji.mp3`, document.baseURI).href;
+				const previous = audio.__exporterInterruptedMusic;
+				const interrupted = audio.src === src && previous ? previous : { src: audio.src, loop: audio.loop, rate: audio.playbackRate };
+				previous?.cleanup?.();
+				const cleanup = () => {
+					audio.removeEventListener("ended", restore, true);
+					audio.removeEventListener("error", restore, true);
+					delete audio.__exporterInterruptedMusic;
+				};
+				const restore = (event: Event) => {
+					if (audio.src !== src) return;
+					event.stopImmediatePropagation();
+					cleanup();
+					audio.pause();
+					audio.loop = interrupted.loop;
+					audio.playbackRate = interrupted.rate;
+					if (lib.config.background_music === "music_off") return;
+					audio.src = interrupted.src;
+					audio.currentTime = 0;
+					game.resumeBackgroundMusic();
+				};
+				audio.__exporterInterruptedMusic = { ...interrupted, cleanup };
+				audio.addEventListener("ended", restore, true);
+				audio.addEventListener("error", restore, true);
+				audio.pause();
+				audio.loop = false;
+				audio.playbackRate = 1;
+				audio.src = src;
+				audio.currentTime = 0;
+				game.resumeBackgroundMusic();
+				return result;
+			};
+		let luokeScheduled = false;
+		w.__exporterStartReplayMusic = () => {
+			if (
+				luokeScheduled ||
+				!enabled() ||
+				_status._aozhan ||
+				!game.players?.some((player: any) => [player.name, player.name1, player.name2].includes("sanmei_luoke"))
+			)
+				return;
+			luokeScheduled = true;
+			const music = `ext:SanmeiKill/audio/background/luoke/${["battle1", "battle2", "battle3"][Math.floor(Math.random() * 3)]}.mp3`;
+			_status.tempMusic = music;
+			ui.backgroundMusic.addEventListener(
+				"ended",
+				() => {
+					if (_status.tempMusic === music) delete _status.tempMusic;
+				},
+				{ once: true }
+			);
+		};
+	}
 	lib.config.link_style2 = "chain";
 	ui.arena.classList.remove("nolink");
 

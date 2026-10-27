@@ -10,6 +10,7 @@
 	</head>
 	<body>
 		<script type="module">
+			import { planAudioClips } from "./audioTimeline.mjs";
 			import {
 				Output,
 				Mp4OutputFormat,
@@ -142,8 +143,10 @@
 				output.addVideoTrack(videoSource, { frameRate: fps });
 
 				// 音频轨：AAC，固定 48kHz 双声道。后续在 finish 时离线混音填充。
-				audioSource = new AudioBufferSource({ codec: "aac", bitrate: QUALITY_HIGH });
-				output.addAudioTrack(audioSource);
+				if (msg.includeAudio !== false) {
+					audioSource = new AudioBufferSource({ codec: "aac", bitrate: QUALITY_HIGH });
+					output.addAudioTrack(audioSource);
+				}
 
 				await output.start();
 				log("inited " + frameWidth + "x" + frameHeight + " fps=" + fps);
@@ -246,12 +249,13 @@
 				await decodeCtx.close();
 
 				const offline = new OfflineAudioContext(AUDIO_CHANNELS, totalFrames, AUDIO_SAMPLE_RATE);
-				for (const ev of audioData.events) {
+				for (const ev of planAudioClips(audioData.events, totalDur)) {
 					const buf = decoded[ev.url];
 					if (!buf) continue;
 					if (ev.t >= totalDur) continue;
 					const src = offline.createBufferSource();
 					src.buffer = buf;
+					src.playbackRate.value = Math.max(0.01, ev.rate || 1);
 					if (ev.loop) {
 						src.loop = true;
 						src.loopStart = 0;
@@ -259,10 +263,10 @@
 					}
 					src.connect(offline.destination);
 					const startAt = Math.max(0, ev.t);
-					src.start(startAt);
+					src.start(startAt, Math.max(0, ev.offset || 0));
 					// 循环音轨（BGM）在视频结束处停止。
 					if (ev.loop) {
-						src.stop(totalDur);
+						src.stop(ev.end);
 					}
 				}
 				const rendered = await offline.startRendering();
@@ -277,7 +281,7 @@
 					// 先离线混音并写入音频轨，再 finalize。
 					try {
 						const mixed = await buildMixedAudio();
-						if (mixed) {
+						if (mixed && audioSource) {
 							await audioSource.add(mixed);
 						}
 					} catch (err) {

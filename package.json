@@ -3,7 +3,7 @@
 	"productName": "三梅杀录像导出工具",
 	"version": "0.1.0",
 	"description": "三梅杀录像导出工具：将《三梅杀》录像文件导出为视频",
-	"main": "dist/main.js",
+	"main": "dist/entry.js",
 	"type": "commonjs",
 	"author": "",
 	"license": "GPL-3.0-only",

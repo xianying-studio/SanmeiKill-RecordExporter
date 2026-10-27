@@ -94,3 +94,49 @@ test("interval 按视频时间触发，rAF 每次推进只触发一轮", async (
 	assert.equal(context.ticks, 3);
 	assert.equal(context.frames, 2);
 });
+
+test("分段快进保留每一轮游戏 rAF 和定时器，只跳过画面提交", async () => {
+	const { context, clock } = clockFixture();
+	vm.runInContext(
+		`window.frames=0;window.ticks=0;setInterval(()=>ticks++,100);function tick(){frames++;requestAnimationFrame(tick)}requestAnimationFrame(tick);`,
+		context
+	);
+	clock.start();
+	await clock.seekFrame(120, 120);
+	assert.equal(context.frames, 120);
+	assert.equal(context.ticks, 9);
+	await clock.advance(1000);
+	assert.equal(context.ticks, 10);
+	assert.equal(context.frames, 121);
+});
+
+test("音乐元数据等外部依赖就绪后才继续推进时间", async () => {
+	const { clock } = clockFixture();
+	clock.start();
+	let loaded = false;
+	clock.track(
+		new Promise(resolve =>
+			setTimeout(() => {
+				loaded = true;
+				resolve();
+			}, 10)
+		)
+	);
+	await clock.advance(500);
+	assert.equal(loaded, true);
+	assert.equal(clock.now(), 500);
+});
+
+test("快速恢复降低早期动画采样，仍保留所有定时器与末尾五秒的完整帧率", async () => {
+	const { context, clock } = clockFixture();
+	vm.runInContext(
+		`window.frames=0;window.ticks=0;setInterval(()=>ticks++,100);function tick(){frames++;requestAnimationFrame(tick)}requestAnimationFrame(tick);`,
+		context
+	);
+	clock.start();
+	await clock.seekFrame(2400, 120);
+	assert.equal(context.ticks, 199);
+	assert.equal(context.frames, 1050);
+	await clock.advance(20000);
+	assert.equal(context.ticks, 200);
+});

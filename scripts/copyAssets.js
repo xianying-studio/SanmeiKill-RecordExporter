@@ -14,6 +14,8 @@ function copy(src, dest) {
 
 // 编码器渲染页（静态 HTML，tsc 不处理）。
 copy(path.join(root, "src", "encoder", "encoder.html"), path.join(dist, "encoder", "encoder.html"));
+const { planAudioClips } = require(path.join(dist, "audioTimeline.js"));
+fs.writeFileSync(path.join(dist, "encoder", "audioTimeline.mjs"), `export const planAudioClips = ${planAudioClips.toString()};\n`);
 
 // mediabunny 单文件 ESM bundle（供编码器页经 app:// 协议 import）。
 copy(path.join(root, "node_modules", "mediabunny", "dist", "bundles", "mediabunny.mjs"), path.join(dist, "vendor", "mediabunny.mjs"));

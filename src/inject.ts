@@ -1,4 +1,5 @@
 import { installReplayPresentation } from "./replayPresentation";
+import { installReplayMusic } from "./replayMusic";
 
 /**
  * 注入到离屏游戏页（主世界）的驱动脚本构建器。
@@ -26,7 +27,8 @@ function injectBody(
 	configPrefix: string,
 	speed: number,
 	zoomPercent: number,
-	restorePresentation: () => boolean
+	restorePresentation: () => boolean,
+	installMusic: (notify: (message: any) => void) => () => void
 ): void {
 	const w = window as any;
 	const PLAY_ARMED = "exporter_play_armed";
@@ -40,6 +42,8 @@ function injectBody(
 	// 「等待压缩」系数：仅压缩回放中的各类「等待」（步间空隙 + 录像 delay 步 + videoContent 内部 game.delay），
 	// 动画时长（写死在样式表里）保持自然速度。时间戳按真实墙钟，不做 ×倍数还原，故无慢动作。
 	const SPEED = speed >= 1 ? speed : 1;
+	const replay = JSON.parse(linkJson);
+	w.__exporterHasMusicEvents = replay.video?.some((event: any) => event.type === "backgroundMusic");
 
 	function notify(m: any): void {
 		try {
@@ -83,7 +87,7 @@ function injectBody(
 		const sentFiles: Set<string> = new Set();
 		let origAppendChild: ((node: any) => any) | null = null;
 		let winEl: HTMLElement | null = null;
-		let bgmDescRestored = false;
+		let stopMusic: (() => void) | undefined;
 		let origDuration: number | null = null;
 		// 最近一次 BGM（loop=true）的 url：用于对 BGM 的循环重设去重，避免离线混音叠成多条重叠循环。
 		let lastBgmUrl = "";
@@ -138,7 +142,7 @@ function injectBody(
 
 			// 2. 接管音效 <audio>：hook appendChild。
 			winEl = (w.ui && w.ui.window) || document.body;
-			if (winEl) {
+			if (winEl && !w.__exporterSkipAudioCapture) {
 				// 已存在的音效元素（一般为空，BGM 单独处理）。
 				winEl.querySelectorAll("audio").forEach((el: any) => {
 					if (el !== (w.ui && w.ui.backgroundMusic) && el.src) {
@@ -159,59 +163,7 @@ function injectBody(
 				} as typeof winEl.appendChild;
 			}
 
-			// 3. 接管 BGM：hook ui.backgroundMusic.src setter（BGM 循环，loop=true）。
-			try {
-				const bgm = w.ui && w.ui.backgroundMusic;
-				if (bgm) {
-					const proto = Object.getPrototypeOf(bgm);
-					const desc = Object.getOwnPropertyDescriptor(proto, "src") || Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "src");
-					if (desc && desc.set && desc.get) {
-						const origSet = desc.set;
-						const origGet = desc.get;
-						Object.defineProperty(bgm, "src", {
-							configurable: true,
-							get() {
-								return origGet.call(this);
-							},
-							set(v: string) {
-								origSet.call(this, v);
-								try {
-									if (v) {
-										emitEvent(this.src || v, true);
-									}
-								} catch {
-									/* ignore */
-								}
-							},
-						});
-						bgmDescRestored = true;
-					}
-				}
-			} catch (err) {
-				notify({ type: "debug", message: "hook BGM 失败: " + err });
-			}
-
-			// 4. 触发并捕获初始 BGM。
-			//    回放在 hook 安装前可能已设置 ui.backgroundMusic.src（BGM 已在播），此时 hook 的 setter 不会回放性地触发，
-			//    导致首条 BGM 事件要等到曲子播完、游戏在循环边界重设 src 时才被捕获（实测约 221s 后）。
-			//    因此先主动触发一次 playBackgroundMusic（其内部会设 src → 命中 hook）；若触发后 src 仍非空但未命中
-			//    （例如值与原值相同、浏览器未再次派发），再直接读取当前 src 兜底补发一次。
-			try {
-				const bgm = w.ui && w.ui.backgroundMusic;
-				const before = bgm ? bgm.src : "";
-				if (w.game && typeof w.game.playBackgroundMusic === "function") {
-					w.game.playBackgroundMusic();
-				}
-				// 兜底：playBackgroundMusic 走 db:/异步分支或未改变 src 时，直接读当前 src 补发（emitEvent 内已按 url 去重）。
-				const after = bgm ? bgm.src : "";
-				if (after) {
-					emitEvent(after, true);
-				} else if (before) {
-					emitEvent(before, true);
-				}
-			} catch {
-				/* ignore */
-			}
+			stopMusic = installMusic(notify);
 
 			notify({ type: "debug", message: "音频事件采集已启动, SPEED=" + SPEED });
 		} catch (err) {
@@ -227,12 +179,7 @@ function injectBody(
 				/* ignore */
 			}
 			try {
-				if (bgmDescRestored) {
-					const bgm = w.ui && w.ui.backgroundMusic;
-					if (bgm) {
-						delete bgm.src; // 删除实例级覆盖，回落到原型 setter
-					}
-				}
+				stopMusic?.();
 			} catch {
 				/* ignore */
 			}
@@ -305,9 +252,16 @@ function injectBody(
 			if (started) {
 				return;
 			}
+			// loading-fade-out 早于 IndexedDB 录像读取完成；快进前必须拿到真实录像根事件。
+			if (!w._status?.video || !findVideoEvent(w._status)?.video?.length) {
+				setTimeout(beginRecording, 10);
+				return;
+			}
 			started = true;
+			w.__exporterReplayEnded = false;
 			restorePresentation();
 			w.__replayClock?.start();
+			if (w.__exporterHasMusicEvents && !stopAudio) stopAudio = startAudioCapture();
 			// 隐藏顶部回放控制条（#system）。用 !important 规则，避免被回放初始化 show() 盖回。
 			try {
 				if (!document.getElementById("exporter-hide-ui-style")) {
@@ -375,6 +329,7 @@ function injectBody(
 						stopAudio();
 						stopAudio = null;
 					}
+					w.__exporterReplayEnded = true;
 					notify({ type: "over" });
 				}, 5000);
 			}
@@ -484,6 +439,9 @@ function injectBody(
 			configStore.put("1x", "video_default_play_speed");
 			configStore.put(`${zoomPercent}%`, "ui_zoom");
 			configStore.put("chain", "link_style2");
+			if (typeof link.audioConfig?.disableEasterEggMusic === "boolean")
+				configStore.put(link.audioConfig.disableEasterEggMusic, "disable_easter_egg_music");
+			if (link.audioConfig?.backgroundMusic !== undefined) configStore.put(link.audioConfig.backgroundMusic, "background_music");
 			tx.oncomplete = () => {
 				try {
 					localStorage.setItem(configPrefix + "playbackmode", link.mode);
@@ -561,5 +519,5 @@ function injectBody(
  * @param speed 录制倍速（游戏以此倍速回放，recorder 端 ×speed 还原为正常速度）
  */
 export function buildInjectScript(linkJson: string, dbName: string, configPrefix: string, speed: number, zoomPercent = 100): string {
-	return `(${injectBody.toString()})(${JSON.stringify(linkJson)}, ${JSON.stringify(dbName)}, ${JSON.stringify(configPrefix)}, ${JSON.stringify(speed)}, ${JSON.stringify(zoomPercent)}, (${installReplayPresentation.toString()}));`;
+	return `(${injectBody.toString()})(${JSON.stringify(linkJson)}, ${JSON.stringify(dbName)}, ${JSON.stringify(configPrefix)}, ${JSON.stringify(speed)}, ${JSON.stringify(zoomPercent)}, (${installReplayPresentation.toString()}), (${installReplayMusic.toString()}));`;
 }

@@ -3,7 +3,8 @@ import path from "path";
 import { PROTOCOL, parseProtocolUrl, type ExportPayload } from "./protocol";
 import { startWsServer, type ExporterConnection, type VideoMessage } from "./wsServer";
 import { registerAppScheme, handleAppScheme } from "./appProtocol";
-import { recordOffscreenToFile } from "./recorder";
+import { recordParallelToFile } from "./parallelRecorder";
+import { estimateReplaySeconds } from "./segmentPlan";
 import { buildInjectScript } from "./inject";
 import { dlog } from "./debugLog";
 import type { ReceivedPackage } from "./packageTransfer";
@@ -149,6 +150,12 @@ function startExport(payload: ExportPayload): void {
 			app.quit();
 		},
 	});
+	app.once("before-quit", () => {
+		if (finished) return;
+		finished = true;
+		aborter?.abort();
+		closeServer();
+	});
 }
 
 /**
@@ -199,9 +206,11 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		}
 		const bytes = await renderWithQualityFallback(
 			({ width, height, fps, zoomPercent }) =>
-				recordOffscreenToFile(
+				recordParallelToFile(
 					{
 						gamePackage: localPackage?.gamePackage,
+						estimatedSeconds: estimateReplaySeconds(JSON.parse(linkJson)),
+						workers: /^[1-8]$/.test(process.env.EXPORTER_RENDER_WORKERS || "") ? Number(process.env.EXPORTER_RENDER_WORKERS) : undefined,
 						renderMode: process.env.EXPORTER_RENDER_MODE === "realtime" ? "realtime" : "frame",
 						url: payload.baseurl,
 						injectScript: buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, WAIT_COMPRESS, zoomPercent),
@@ -232,6 +241,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		conn.progress("encode", 100);
 		conn.done();
 	} catch (e: any) {
+		if (signal?.aborted || e?.name === "AbortError") return;
 		dlog("录制失败:", e && e.message ? e.message : String(e));
 		console.error("[record-exporter] 录制失败：", e);
 		conn.error("录制失败：" + (e && e.message ? e.message : String(e)));
