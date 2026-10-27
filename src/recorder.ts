@@ -6,6 +6,7 @@ import { dlog } from "./debugLog";
 import { CapturedFrame } from "./capturedFrame";
 import type { GamePackage } from "./gamePackage";
 import { buildReplayClockScript } from "./replayClock";
+import type { VideoFile } from "./videoFile";
 
 /** 录制参数。 */
 export interface RecordOptions {
@@ -71,6 +72,27 @@ const ABORT_REASON = "已取消：WebSocket 连接已断开";
  * @returns 编码完成的 MP4 字节
  */
 export async function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
+	const file = await renderToTemporaryFile(opts);
+	try {
+		return await file.read();
+	} finally {
+		await file.dispose();
+	}
+}
+
+/** 正式导出直接保存磁盘上的封装结果，避免跨进程复制数 GB 的视频。 */
+export async function recordOffscreenToFile(opts: RecordOptions, destination: string): Promise<number> {
+	const file = await renderToTemporaryFile(opts);
+	try {
+		opts.signal?.throwIfAborted();
+		await file.copyTo(destination);
+		return file.bytes;
+	} finally {
+		await file.dispose();
+	}
+}
+
+async function renderToTemporaryFile(opts: RecordOptions): Promise<VideoFile> {
 	try {
 		return await recordAttempt(opts);
 	} catch (error) {
@@ -81,8 +103,8 @@ export async function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 	}
 }
 
-function recordAttempt(opts: RecordOptions): Promise<Buffer> {
-	return new Promise<Buffer>((resolve, reject) => {
+function recordAttempt(opts: RecordOptions): Promise<VideoFile> {
+	return new Promise<VideoFile>((resolve, reject) => {
 		const useSharedTexture = opts.frameTransport !== "bitmap" && (process.platform === "win32" || process.platform === "darwin");
 		const pendingFrames = new Set<Promise<void>>();
 		const replaySession = opts.gamePackage ? session.fromPartition("replay-export-" + randomUUID()) : undefined;
@@ -202,8 +224,18 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 					await new Promise<void>(resolve => setImmediate(resolve));
 					if (settled || !latestFrame) return;
 					lastVideoTs = timestamp;
-					await latestFrame.send(encoder, timestamp);
+					// 最多两帧在途，允许编码上一帧时合成下一帧，同时限制 GPU 纹理占用。
+					const pending = latestFrame.send(encoder, timestamp);
+					pendingFrames.add(pending);
+					void pending.then(
+						() => pendingFrames.delete(pending),
+						error => {
+							pendingFrames.delete(pending);
+							fail(error);
+						}
+					);
 					frameCount++;
+					if (pendingFrames.size >= 2) await Promise.race(pendingFrames);
 					if (!capturing) break;
 				}
 				if (!settled) finishEncoding();
@@ -301,13 +333,14 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 			fail(err instanceof Error ? err : new Error(String(err)));
 		};
 
-		const succeed = (buf: Buffer) => {
+		const succeed = (file: VideoFile) => {
 			if (settled) {
+				void file.dispose();
 				return;
 			}
 			settled = true;
 			cleanup();
-			resolve(buf);
+			resolve(file);
 		};
 
 		const onNotify = (event: Electron.IpcMainEvent, msg: NotifyMessage) => {

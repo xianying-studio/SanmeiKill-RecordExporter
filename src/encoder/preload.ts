@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, sharedTexture } from "electron";
+let writeChannel: string | undefined;
 
 // VideoFrame 是可转移对象，须经 postMessage 进入主世界，不能经 contextBridge 复制。
 sharedTexture.setSharedTextureReceiver(async ({ importedSharedTexture }, timestampSec: number, frameId: number) => {
@@ -22,7 +23,15 @@ sharedTexture.setSharedTextureReceiver(async ({ importedSharedTexture }, timesta
 contextBridge.exposeInMainWorld("encoderBridge", {
 	/** 注册来自主进程的消息回调。 */
 	onMessage: (cb: (msg: any) => void) => {
-		ipcRenderer.on("encoder:from-main", (_e, msg) => cb(msg));
+		ipcRenderer.on("encoder:from-main", (_e, msg) => {
+			if (msg.type === "init") writeChannel = msg.writeChannel;
+			cb(msg);
+		});
+	},
+	/** 每块写完后才确认，封装器据此施加背压。 */
+	write: (position: number, data: Uint8Array) => {
+		if (!writeChannel) throw new Error("视频写入通道尚未就绪");
+		return ipcRenderer.invoke(writeChannel, position, data);
 	},
 	/** 向主进程发送消息（如编码完成的 MP4 字节、进度、错误）。 */
 	send: (msg: any) => ipcRenderer.send("encoder:to-main", msg),

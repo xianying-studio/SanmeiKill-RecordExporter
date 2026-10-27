@@ -1,10 +1,9 @@
 import { app, dialog, Menu } from "electron";
 import path from "path";
-import fs from "fs";
 import { PROTOCOL, parseProtocolUrl, type ExportPayload } from "./protocol";
 import { startWsServer, type ExporterConnection, type VideoMessage } from "./wsServer";
 import { registerAppScheme, handleAppScheme } from "./appProtocol";
-import { recordOffscreen } from "./recorder";
+import { recordOffscreenToFile } from "./recorder";
 import { buildInjectScript } from "./inject";
 import { dlog } from "./debugLog";
 import type { ReceivedPackage } from "./packageTransfer";
@@ -198,22 +197,25 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 			localPackage = await conn.receivePackage(signal);
 			conn.progress("package", 100);
 		}
-		const buffer = await renderWithQualityFallback(
+		const bytes = await renderWithQualityFallback(
 			({ width, height, fps, zoomPercent }) =>
-				recordOffscreen({
-					gamePackage: localPackage?.gamePackage,
-					renderMode: process.env.EXPORTER_RENDER_MODE === "realtime" ? "realtime" : "frame",
-					url: payload.baseurl,
-					injectScript: buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, WAIT_COMPRESS, zoomPercent),
-					width,
-					height,
-					fps,
-					frameTransport: process.env.EXPORTER_FRAME_TRANSPORT === "bitmap" ? "bitmap" : "auto",
-					speed: WAIT_COMPRESS,
-					onStage: (stage, percent) => conn.progress(stage, percent),
-					onLog: m => dlog(m),
-					signal,
-				}),
+				recordOffscreenToFile(
+					{
+						gamePackage: localPackage?.gamePackage,
+						renderMode: process.env.EXPORTER_RENDER_MODE === "realtime" ? "realtime" : "frame",
+						url: payload.baseurl,
+						injectScript: buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, WAIT_COMPRESS, zoomPercent),
+						width,
+						height,
+						fps,
+						frameTransport: process.env.EXPORTER_FRAME_TRANSPORT === "bitmap" ? "bitmap" : "auto",
+						speed: WAIT_COMPRESS,
+						onStage: (stage, percent) => conn.progress(stage, percent),
+						onLog: m => dlog(m),
+						signal,
+					},
+					savePath
+				),
 			{
 				signal,
 				onFallback: error => {
@@ -226,8 +228,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 			return;
 		}
 		// 4. 写盘并汇报完成。
-		await fs.promises.writeFile(savePath, buffer);
-		dlog("录制完成, 已写盘, 字节=", buffer.length);
+		dlog("录制完成, 已写盘, 字节=", bytes);
 		conn.progress("encode", 100);
 		conn.done();
 	} catch (e: any) {

@@ -13,7 +13,7 @@
 			import {
 				Output,
 				Mp4OutputFormat,
-				BufferTarget,
+				StreamTarget,
 				VideoSampleSource,
 				VideoSample,
 				AudioBufferSource,
@@ -97,8 +97,13 @@
 				frameDuration = 1 / Math.max(1, fps);
 
 				output = new Output({
-					format: new Mp4OutputFormat({ fastStart: "in-memory" }),
-					target: new BufferTarget(),
+					format: new Mp4OutputFormat({ fastStart: false }),
+					target: new StreamTarget(
+						new WritableStream({
+							write: chunk => bridge.write(chunk.position, chunk.data),
+						}),
+						{ chunked: true, chunkSize: 1024 * 1024 }
+					),
 				});
 
 				// 视频轨：直接编码 BGRA 原始帧（无 canvas、无逐像素 swizzle）。
@@ -279,9 +284,8 @@
 						log("音频混音失败（将输出无声视频）: " + (err && err.stack ? err.stack : String(err)));
 					}
 					await output.finalize();
-					const buffer = output.target.buffer;
-					log("finalize 完成, 字节=" + (buffer && buffer.byteLength));
-					bridge.send({ type: "done", buffer, encodedFrames }, [buffer]);
+					log("finalize 完成，视频已分块写入磁盘");
+					bridge.send({ type: "done", encodedFrames });
 				} catch (err) {
 					bridge.send({ type: "error", message: err && err.stack ? err.stack : String(err) });
 				}

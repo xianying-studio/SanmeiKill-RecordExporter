@@ -1,6 +1,8 @@
 import { BrowserWindow, ipcMain, MessageChannelMain, MessagePortMain, sharedTexture } from "electron";
 import path from "path";
 import { appUrl } from "../appProtocol";
+import { randomUUID } from "node:crypto";
+import { VideoFile } from "../videoFile";
 
 /**
  * 主进程侧的「编码器窗口」封装。
@@ -8,13 +10,15 @@ import { appUrl } from "../appProtocol";
  * 它创建一个隐藏的普通渲染窗口，加载 app://bundle/encoder/encoder.html，
  * 在其主世界用 mediabunny + WebCodecs 把逐帧 BGRA 画面编码为 H.264 MP4。
  *
- * 主进程通过本类把离屏游戏窗口产出的帧推送给编码器，最终取回 MP4 字节。
+ * 主进程通过本类把离屏游戏窗口产出的帧推送给编码器，最终取回已分块写盘的 MP4。
  */
 export class EncoderWindow {
 	private win: BrowserWindow | null = null;
 	private readyResolve: (() => void) | null = null;
 	private initedResolve: (() => void) | null = null;
-	private doneResolve: ((buf: Buffer) => void) | null = null;
+	private doneResolve: ((file: VideoFile) => void) | null = null;
+	private videoFile: VideoFile | null = null;
+	private writeChannel = "encoder:write:" + randomUUID();
 	private failed: ((err: Error) => void) | null = null;
 	private rejected = false;
 	/** 帧专用通道（主进程侧端口）；帧经此 postMessage 投送到编码器主世界。 */
@@ -37,6 +41,7 @@ export class EncoderWindow {
 
 	/** 创建窗口并等待编码器就绪。 */
 	async open(): Promise<void> {
+		this.videoFile = await VideoFile.create();
 		this.win = new BrowserWindow({
 			show: false,
 			webPreferences: {
@@ -47,6 +52,10 @@ export class EncoderWindow {
 			},
 		});
 		const wcId = this.win.webContents.id;
+		ipcMain.handle(this.writeChannel, async (event, position: number, data: Uint8Array) => {
+			if (!this.win || event.sender !== this.win.webContents || !this.videoFile) throw new Error("视频写入通道已关闭");
+			await this.videoFile.write(position, data);
+		});
 
 		this.win.webContents.on("console-message", (_e, _l, message) => this.onLog?.("[enc-console] " + message));
 		this.win.webContents.on("did-fail-load", (_e, code, desc, url) => this.onLog?.(`[enc-fail] ${code} ${desc} ${url}`));
@@ -94,7 +103,17 @@ export class EncoderWindow {
 				this.onLog?.(String(msg.message));
 				break;
 			case "done":
-				this.doneResolve?.(Buffer.from(msg.buffer));
+				if (this.videoFile) {
+					const file = this.videoFile;
+					void file.finish().then(
+						() => {
+							if (this.videoFile !== file) return;
+							this.videoFile = null;
+							this.doneResolve?.(file);
+						},
+						error => this.reject(error)
+					);
+				}
 				break;
 			case "error": {
 				const err = new Error(String(msg.message || "编码器错误"));
@@ -122,7 +141,7 @@ export class EncoderWindow {
 			this.initedResolve = resolve;
 			this.failed = reject;
 		});
-		this.send({ type: "init", width, height, fps, bitrate });
+		this.send({ type: "init", width, height, fps, bitrate, writeChannel: this.writeChannel });
 		await inited;
 	}
 
@@ -165,9 +184,9 @@ export class EncoderWindow {
 		this.send({ type: "audio-data", events, files, totalDurationSec });
 	}
 
-	/** 通知编码结束，等待并返回最终 MP4 字节。 */
-	async finish(): Promise<Buffer> {
-		const done = new Promise<Buffer>((resolve, reject) => {
+	/** 通知编码结束，等待并返回已完成封装的临时 MP4 文件。 */
+	async finish(): Promise<VideoFile> {
+		const done = new Promise<VideoFile>((resolve, reject) => {
 			this.doneResolve = resolve;
 			this.failed = reject;
 		});
@@ -184,6 +203,10 @@ export class EncoderWindow {
 	/** 销毁窗口并解绑监听。 */
 	close(): void {
 		this.reject(new Error("编码器已关闭"));
+		ipcMain.removeHandler(this.writeChannel);
+		const file = this.videoFile;
+		this.videoFile = null;
+		void file?.dispose().catch(error => this.onLog?.("清理临时视频失败：" + String(error)));
 		ipcMain.removeListener("encoder:to-main", this.onMessage);
 		if (this.framePort) {
 			try {

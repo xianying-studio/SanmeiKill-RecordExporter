@@ -1,7 +1,15 @@
-const { test } = require("node:test");
+const { test, afterEach } = require("node:test");
+const { MessageChannel } = require("node:worker_threads");
 const assert = require("node:assert/strict");
 const vm = require("node:vm");
 const { buildReplayClockScript } = require("../dist/replayClock");
+const channels = [];
+afterEach(() => {
+	for (const channel of channels.splice(0)) {
+		channel.port1.close();
+		channel.port2.close();
+	}
+});
 function clockFixture() {
 	class Animation {
 		constructor() {
@@ -37,6 +45,12 @@ function clockFixture() {
 		Number,
 		Math,
 		Error,
+		MessageChannel: class extends MessageChannel {
+			constructor() {
+				super();
+				channels.push(this);
+			}
+		},
 	};
 	context.window = context;
 	vm.createContext(context);

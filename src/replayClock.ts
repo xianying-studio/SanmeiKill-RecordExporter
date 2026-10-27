@@ -90,7 +90,19 @@ function installReplayClock(): void {
 			}
 		}
 	};
-	const hostTurn = () => new Promise<void>(resolve => timeout(resolve, 0));
+	// 消息任务让浏览器处理 Promise/网络回调，不受原生定时器最小延迟限制。
+	const channel = new MessageChannel();
+	let resumeHostTurn: (() => void) | undefined;
+	channel.port1.onmessage = () => {
+		const resolve = resumeHostTurn;
+		resumeHostTurn = undefined;
+		resolve?.();
+	};
+	const hostTurn = () =>
+		new Promise<void>(resolve => {
+			resumeHostTurn = resolve;
+			channel.port2.postMessage(null);
+		});
 	w.__replayClock = {
 		get active() {
 			return active;
