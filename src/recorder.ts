@@ -17,7 +17,7 @@ export interface RecordOptions {
 	width: number;
 	/** 录制画面高。 */
 	height: number;
-	/** 采样帧率（离屏 paint 的 setFrameRate；倍速下应尽量高，Electron offscreen 上限 240）。 */
+	/** 成片帧率；逐帧模式按此帧率推进视频时间，实时模式按此帧率采样。 */
 	fps: number;
 	/** 等待压缩系数：仅供注入脚本使用，用于压缩回放中的各类「等待」。不影响帧/音频时间戳；默认 1。 */
 	speed?: number;

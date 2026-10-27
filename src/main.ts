@@ -8,6 +8,7 @@ import { recordOffscreen } from "./recorder";
 import { buildInjectScript } from "./inject";
 import { dlog } from "./debugLog";
 import type { ReceivedPackage } from "./packageTransfer";
+import { renderWithQualityFallback } from "./renderQualityFallback";
 
 /**
  * 三梅杀录像导出工具 —— 主进程入口。
@@ -28,17 +29,12 @@ let receivedProtocolUrl = false;
 /** 是否正在导出（录制中临时窗口关闭不应触发整体退出）。 */
 let exporting = false;
 
-/** 录制画面尺寸（离屏窗口逻辑尺寸）。 */
-const RECORD_WIDTH = 1920;
-const RECORD_HEIGHT = 1080;
-
 /**
  * 等待压缩系数：=1 表示原速录制（不压缩任何等待，观感与实际游戏一致）。
  * 历史上曾尝试 >1 压缩各类「等待」以加快导出，但实测加速后观感不佳（动画与节奏割裂），故改回原速。
  * 保留该参数与链路：若将来需要再次提速，调大此值即可（注入脚本据此压缩 videoDuration 与 lib.config.duration）。
  */
 const WAIT_COMPRESS = 1;
-const CAPTURE_FPS = 60;
 
 /** 游戏 IndexedDB 数据库名与配置前缀（configprefix 固定为 noname_0.9_）。 */
 const GAME_DB_NAME = "noname_0.9_data";
@@ -203,20 +199,30 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 			localPackage = await conn.receivePackage(signal);
 			conn.progress("package", 100);
 		}
-		const buffer = await recordOffscreen({
-			gamePackage: localPackage?.gamePackage,
-			renderMode: process.env.EXPORTER_RENDER_MODE === "realtime" ? "realtime" : "frame",
-			url: payload.baseurl,
-			injectScript,
-			width: RECORD_WIDTH,
-			height: RECORD_HEIGHT,
-			fps: CAPTURE_FPS,
-			frameTransport: process.env.EXPORTER_FRAME_TRANSPORT === "bitmap" ? "bitmap" : "auto",
-			speed: WAIT_COMPRESS,
-			onStage: (stage, percent) => conn.progress(stage, percent),
-			onLog: m => dlog(m),
-			signal,
-		});
+		const buffer = await renderWithQualityFallback(
+			({ width, height, fps }) =>
+				recordOffscreen({
+					gamePackage: localPackage?.gamePackage,
+					renderMode: process.env.EXPORTER_RENDER_MODE === "realtime" ? "realtime" : "frame",
+					url: payload.baseurl,
+					injectScript,
+					width,
+					height,
+					fps,
+					frameTransport: process.env.EXPORTER_FRAME_TRANSPORT === "bitmap" ? "bitmap" : "auto",
+					speed: WAIT_COMPRESS,
+					onStage: (stage, percent) => conn.progress(stage, percent),
+					onLog: m => dlog(m),
+					signal,
+				}),
+			{
+				signal,
+				onFallback: error => {
+					dlog("2K 120 FPS 导出失败，重新以 1080p 60 FPS 导出：", String(error));
+					conn.progress("load", 0);
+				},
+			}
+		);
 		if (signal?.aborted) {
 			return;
 		}

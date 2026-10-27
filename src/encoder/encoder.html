@@ -67,7 +67,11 @@
 				if (typeof VideoEncoder === "undefined" || !VideoEncoder.isConfigSupported) {
 					return null;
 				}
-				const candidates = ["avc1.640028", "avc1.640020", "avc1.64001f", "avc1.4d4028", "avc1.42e028"];
+				// 高帧率先探测更高的 H.264 level，尺寸、帧率和驱动支持仍由 WebCodecs 实际确认。
+				const candidates =
+					fps > 60
+						? ["avc1.640034", "avc1.640033", "avc1.4d4034", "avc1.42e034"]
+						: ["avc1.64002a", "avc1.640028", "avc1.640020", "avc1.64001f", "avc1.4d4028", "avc1.42e028"];
 				for (const cs of candidates) {
 					try {
 						const r = await VideoEncoder.isConfigSupported({
