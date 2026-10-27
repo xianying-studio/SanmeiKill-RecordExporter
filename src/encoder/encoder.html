@@ -1,13 +1,25 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
 	<head>
 		<meta charset="utf-8" />
-		<meta http-equiv="Content-Security-Policy" content="default-src 'self' app:; script-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob:;" />
+		<meta
+			http-equiv="Content-Security-Policy"
+			content="default-src 'self' app:; script-src 'self' app: 'unsafe-inline'; img-src 'self' app: data: blob:;"
+		/>
 		<title>encoder</title>
 	</head>
 	<body>
 		<script type="module">
-			import { Output, Mp4OutputFormat, BufferTarget, VideoSampleSource, VideoSample, AudioBufferSource, QUALITY_HIGH, QUALITY_VERY_HIGH } from "/vendor/mediabunny.mjs";
+			import {
+				Output,
+				Mp4OutputFormat,
+				BufferTarget,
+				VideoSampleSource,
+				VideoSample,
+				AudioBufferSource,
+				QUALITY_HIGH,
+				QUALITY_VERY_HIGH,
+			} from "/vendor/mediabunny.mjs";
 
 			const bridge = window.encoderBridge;
 
@@ -135,33 +147,50 @@
 				try {
 					while (videoQueue.length) {
 						const item = videoQueue.shift();
-						const bytes = item.bytes instanceof Uint8Array ? item.bytes : new Uint8Array(item.bytes);
+						const bytes = item.frame ? null : item.bytes instanceof Uint8Array ? item.bytes : new Uint8Array(item.bytes);
 						const expected = frameWidth * frameHeight * 4;
-						if (bytes.byteLength !== expected) {
+						if (bytes && bytes.byteLength !== expected) {
 							// 字节数与 codedWidth*codedHeight*4 不符（多为设备像素缩放）：跳过该帧并告警，避免 VideoSample 抛错。
 							if (!sizeWarned) {
 								sizeWarned = true;
-								log("帧字节数不符: got " + bytes.byteLength + ", expected " + expected + " (" + frameWidth + "x" + frameHeight + ")，已跳过此类帧");
+								log(
+									"帧字节数不符: got " +
+										bytes.byteLength +
+										", expected " +
+										expected +
+										" (" +
+										frameWidth +
+										"x" +
+										frameHeight +
+										")，已跳过此类帧"
+								);
 							}
-							continue;
+							throw new Error("帧尺寸与编码参数不一致");
 						}
 						if (!firstFrameLogged) {
 							firstFrameLogged = true;
 							log("首帧到达并开始编码");
 						}
 						// 直接以 BGRA 原始像素构造 VideoSample → 交给硬件/软件编码器，省掉 canvas 与通道交换循环。
-						const sample = new VideoSample(bytes, {
-							format: "BGRA",
-							codedWidth: frameWidth,
-							codedHeight: frameHeight,
-							timestamp: item.timestampSec,
-							duration: frameDuration,
-						});
+						const sample = item.frame
+							? new VideoSample(item.frame, {
+									timestamp: item.timestampSec,
+									duration: frameDuration,
+								})
+							: new VideoSample(bytes, {
+									format: "BGRA",
+									codedWidth: frameWidth,
+									codedHeight: frameHeight,
+									timestamp: item.timestampSec,
+									duration: frameDuration,
+								});
 						try {
 							await videoSource.add(sample);
 						} finally {
 							sample.close();
+							item.frame?.close();
 						}
+						bridge.send({ type: "frame-done", frameId: item.frameId });
 						encodedFrames++;
 						if (encodedFrames % 10 === 0) {
 							bridge.send({ type: "progress", encodedFrames });
@@ -276,6 +305,12 @@
 			// 帧通道：preload 把主进程发来的 MessagePort 通过 window.postMessage 转入主世界（端口随消息 transfer）。
 			// 帧数据（BGRA + 时间戳）经此端口直达，避免与控制/音频大消息抢同一条 ipc 通道。
 			window.addEventListener("message", ev => {
+				if (ev.source !== window) return;
+				if (ev.data?.type === "encoder:shared-frame") {
+					videoQueue.push(ev.data);
+					void drainVideo();
+					return;
+				}
 				if (ev.data === "encoder:frame-port" && ev.ports && ev.ports[0]) {
 					const port = ev.ports[0];
 					port.onmessage = m => {
@@ -288,7 +323,7 @@
 									log("编码落后，丢弃最旧帧防 OOM，累计丢弃=" + droppedFrames + " 队列=" + videoQueue.length);
 								}
 							}
-							videoQueue.push({ bytes: d.bytes, timestampSec: d.timestampSec });
+							videoQueue.push({ bytes: d.bytes, timestampSec: d.timestampSec, frameId: d.frameId });
 							drainVideo();
 						}
 					};

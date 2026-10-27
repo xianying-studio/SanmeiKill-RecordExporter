@@ -2,6 +2,7 @@ import { BrowserWindow, ipcMain } from "electron";
 import path from "path";
 import { EncoderWindow } from "./encoder/encoderWindow";
 import { dlog } from "./debugLog";
+import { CapturedFrame } from "./capturedFrame";
 
 /** 录制参数。 */
 export interface RecordOptions {
@@ -27,6 +28,8 @@ export interface RecordOptions {
 	timeoutMs?: number;
 	/** 取消信号：触发后立即中止录制并清理离屏/编码器窗口。 */
 	signal?: AbortSignal;
+	/** auto 优先使用 Windows/macOS 的 GPU 共享纹理；bitmap 保留兼容路径。 */
+	frameTransport?: "auto" | "shared-texture" | "bitmap";
 }
 
 /** 来自注入脚本的回报消息类型。 */
@@ -55,14 +58,27 @@ const ABORT_REASON = "已取消：WebSocket 连接已断开";
 /**
  * 离屏加载页面、注入驱动脚本播放录像、按墙钟时间戳逐帧编码为 MP4。
  *
-	 * 帧来源为离屏窗口的 paint 事件（NativeImage / BGRA）。时间戳采用「recording-start 后的真实墙钟相对时间」：
-	 * 注入脚本可用 speed 压缩回放中的各类「等待」，但 recorder 端不对时间戳做倍速换算。
-	 * 音频不实时采集 PCM（倍速会变调），而是收集「播放事件 + 文件」，由编码端离线混音定位到正确时间。
+ * 帧来源为离屏窗口的 paint 事件（NativeImage / BGRA）。时间戳采用「recording-start 后的真实墙钟相对时间」：
+ * 注入脚本可用 speed 压缩回放中的各类「等待」，但 recorder 端不对时间戳做倍速换算。
+ * 音频不实时采集 PCM（倍速会变调），而是收集「播放事件 + 文件」，由编码端离线混音定位到正确时间。
  *
  * @returns 编码完成的 MP4 字节
  */
-export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
+export async function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
+	try {
+		return await recordAttempt(opts);
+	} catch (error) {
+		if (opts.frameTransport && opts.frameTransport !== "auto") throw error;
+		if (!(error instanceof Error) || !error.message.startsWith("共享纹理不可用：")) throw error;
+		opts.onLog?.(`${error.message}；切换位图兼容模式`);
+		return recordAttempt({ ...opts, frameTransport: "bitmap" });
+	}
+}
+
+function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 	return new Promise<Buffer>((resolve, reject) => {
+		const useSharedTexture = opts.frameTransport !== "bitmap" && (process.platform === "win32" || process.platform === "darwin");
+		const pendingFrames = new Set<Promise<void>>();
 		const speed = opts.speed && opts.speed >= 1 ? opts.speed : 1;
 		// 时间戳按真实墙钟（不做 ×speed 还原）：游戏只压缩了「等待」、动画保持自然速度，
 		// 故录制墙钟时间本身即为正确的视频时间线。speed 仅由注入脚本用于压缩等待，与时间戳无关。
@@ -92,7 +108,7 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		// 现在 paint 只更新「最近一帧」缓存，由本泵以固定 1/fps 节奏，把最近帧量化到严格均匀的
 		// idx×(1/fps) 时间网格上产帧（hold-last-frame，OBS/录屏软件的标准做法）：
 		// 采集再抖、再漏，输出始终是严格 CFR，且时间戳与 duration 完全一致。
-		let latestBitmap: Buffer | null = null; // 最近一帧 BGRA 位图（paint 写入，泵读取）
+		let latestFrame: CapturedFrame | null = null;
 		let outIdx = 0; // 下一个待产出的 CFR 帧序号（时间戳 = outIdx / fps）
 		let outStarted = false; // 是否已对齐首帧网格（首次产帧时按墙钟对齐，避免开场补一串重复帧）
 		// 诊断计数：每秒比对「真实 paint/s」与「产出 output/s」，区分 macOS 上是采集漏帧还是时间轴抖动。
@@ -110,7 +126,7 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			}
 			const slotMs = Math.max(4, Math.round(1000 / effectiveFps));
 			outputTimer = setInterval(() => {
-				if (!capturing || settled || !inited || !latestBitmap) {
+				if (!capturing || settled || !inited || !latestFrame) {
 					return;
 				}
 				const targetIdx = Math.floor(((Date.now() - startTime) / 1000) * effectiveFps);
@@ -119,16 +135,14 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					// 使首帧时间戳 ≈ 真实墙钟时间，与音频事件（同样以 startTime 为零点打戳）保持音画同步。
 					outIdx = Math.max(0, targetIdx);
 					outStarted = true;
-					emitOutputFrame();
-					outIdx++;
 				}
 				// 追平到目标网格：泵 tick 本身可能被延迟，这里把缺口用「最近帧」补满，确保严格 CFR 无空洞。
 				let budget = MAX_CATCHUP;
 				while (outIdx <= targetIdx && budget-- > 0) {
-					emitOutputFrame();
+					if (!emitOutputFrame()) break;
 					outIdx++;
 				}
-				if (outIdx <= targetIdx) {
+				if (budget <= 0 && outIdx <= targetIdx) {
 					// 触达单 tick 上界：跳过积压的缺口并重置序号，避免雪崩式补帧（仅异常路径）。
 					dlog("CFR 泵补帧超上界，跳过缺口:", targetIdx - outIdx, "帧");
 					outIdx = targetIdx + 1;
@@ -148,13 +162,16 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 
 		// 以当前「最近一帧」缓存产出一帧，时间戳严格落在 outIdx/fps 的均匀网格上。
 		const emitOutputFrame = () => {
-			if (!latestBitmap) {
-				return;
+			if (!latestFrame || encoder.bufferedFrames >= 4) {
+				return false;
 			}
 			const ts = outIdx / effectiveFps;
 			lastVideoTs = ts;
-			encoder.pushFrame(latestBitmap, ts);
+			const pending = latestFrame.send(encoder, ts);
+			pendingFrames.add(pending);
+			void pending.catch(error => fail(error)).finally(() => pendingFrames.delete(pending));
 			frameCount++;
+			return true;
 		};
 
 		// 「补帧泵」：Electron 离屏渲染默认只在脏矩形变化时出 paint，静止画面（牌桌/角色/手牌不动）
@@ -214,7 +231,8 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 				clearInterval(outputTimer);
 				outputTimer = null;
 			}
-			latestBitmap = null;
+			latestFrame?.release();
+			latestFrame = null;
 			opts.signal?.removeEventListener("abort", onAbort);
 			ipcMain.removeListener("offscreen:notify", onNotify);
 			if (offscreen && !offscreen.isDestroyed()) {
@@ -322,6 +340,7 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 		// 且每个 fetch 加超时，避免任一请求挂起拖死整个收尾流程（历史卡死点）。
 		const prepareAudioAndFinish = async () => {
 			try {
+				await Promise.all(pendingFrames);
 				const needed = new Set<string>();
 				for (const ev of audioEvents) {
 					if (!audioFiles[ev.url] && !ev.url.startsWith("blob:")) {
@@ -353,17 +372,32 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 				.catch(err => fail(err instanceof Error ? err : new Error(String(err))));
 		};
 
-		const onPaint = (_e: Electron.Event, _dirty: Electron.Rectangle, image: Electron.NativeImage) => {
+		const onPaint = (
+			e: Electron.Event & { texture?: Electron.OffscreenSharedTexture },
+			_dirty: Electron.Rectangle,
+			image: Electron.NativeImage
+		) => {
+			if (useSharedTexture && !e.texture) {
+				// invalidate() 可能额外产生无纹理的 paint；它不表示正常 GPU 帧流已经失效。
+				return;
+			}
+			if (e.texture && timer) {
+				clearTimeout(timer);
+				timer = null;
+			}
 			if (!capturing || settled) {
+				e.texture?.release();
 				return;
 			}
 			// 记录出帧时刻：补帧泵据此判断「游戏是否正在自然出帧」，避免与之叠加造成 readback 翻倍。
 			lastPaintAt = Date.now();
-			const size = image.getSize();
+			const size = e.texture?.textureInfo.codedSize ?? image.getSize();
 			if (size.width === 0 || size.height === 0) {
+				e.texture?.release();
 				return;
 			}
 			if (!inited) {
+				e.texture?.release();
 				if (initing) {
 					return;
 				}
@@ -380,7 +414,13 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 			// 真正的视频帧由 CFR 输出泵以恒定 1/fps 节奏从此缓存产出，彻底消除帧率不稳。
 			// 必须拷贝：getBitmap() 返回的 Buffer 不复制底层内存，仅在当前 tick 内有效，下次 paint 即被覆写/销毁；
 			// 而本缓存要跨 tick 供输出泵反复读取，故 Buffer.from 复制一份持有。
-			latestBitmap = Buffer.from(image.getBitmap());
+			try {
+				const nextFrame = e.texture ? CapturedFrame.fromTexture(e.texture) : CapturedFrame.fromBitmap(image);
+				latestFrame?.release();
+				latestFrame = nextFrame;
+			} catch (error) {
+				fail(new Error("共享纹理不可用：" + String(error)));
+			}
 			paintCount++;
 		};
 
@@ -406,7 +446,7 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					width: opts.width,
 					height: opts.height,
 					webPreferences: {
-						offscreen: true,
+						offscreen: { useSharedTexture },
 						preload: path.join(__dirname, "offscreen", "preload.js"),
 						contextIsolation: true,
 						nodeIntegration: false,
@@ -414,6 +454,9 @@ export function recordOffscreen(opts: RecordOptions): Promise<Buffer> {
 					},
 				});
 				offscreen.webContents.setFrameRate(opts.fps);
+				if (useSharedTexture) {
+					timer = setTimeout(() => fail(new Error("共享纹理不可用：等待 GPU 帧超时")), 15000);
+				}
 				// 静音离屏窗口：录制为纯画面，游戏 BGM/音效不应外放打扰用户。
 				// setAudioMuted 仅静音本 webContents，不影响系统其他声音，也不影响截帧。
 				offscreen.webContents.setAudioMuted(true);
@@ -536,7 +579,9 @@ function buildDiagnosticsScript(): string {
 				const wallDelta = nowWall - lastWallMs;
 				const timelineDelta = nowTimeline - lastTimelineMs;
 				const clockRatio = wallDelta > 0 ? +(timelineDelta / wallDelta).toFixed(3) : 0;
-				report(`anim-probe rafFps=${rafCount} clockRatio=${clockRatio} timelineDeltaMs=${Math.round(timelineDelta)} wallDeltaMs=${wallDelta}`);
+				report(
+					`anim-probe rafFps=${rafCount} clockRatio=${clockRatio} timelineDeltaMs=${Math.round(timelineDelta)} wallDeltaMs=${wallDelta}`
+				);
 				rafCount = 0;
 				lastWallMs = nowWall;
 				lastTimelineMs = nowTimeline;

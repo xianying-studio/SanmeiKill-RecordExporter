@@ -1,4 +1,4 @@
-import { BrowserWindow, ipcMain, MessageChannelMain, MessagePortMain } from "electron";
+import { BrowserWindow, ipcMain, MessageChannelMain, MessagePortMain, sharedTexture } from "electron";
 import path from "path";
 import { appUrl } from "../appProtocol";
 
@@ -19,6 +19,12 @@ export class EncoderWindow {
 	private rejected = false;
 	/** 帧专用通道（主进程侧端口）；帧经此 postMessage 投送到编码器主世界。 */
 	private framePort: MessagePortMain | null = null;
+	private frameSequence = 0;
+	private pendingFrames = new Map<number, { resolve: () => void; reject: (error: Error) => void }>();
+
+	get bufferedFrames(): number {
+		return this.pendingFrames.size;
+	}
 
 	/** 编码进度回调（已编码帧数）。 */
 	onProgress?: (encodedFrames: number) => void;
@@ -51,9 +57,8 @@ export class EncoderWindow {
 			this.readyResolve = resolve;
 			this.failed = reject;
 		});
-		await this.win.loadURL(appUrl("encoder/encoder.html"));
+		await Promise.all([this.win.loadURL(appUrl("encoder/encoder.html")), ready]);
 		void wcId;
-		await ready;
 
 		// 建立帧专用通道：把 port2 transfer 给渲染进程（preload 再转入主世界），port1 留在主进程用于投帧。
 		const { port1, port2 } = new MessageChannelMain();
@@ -76,6 +81,12 @@ export class EncoderWindow {
 			case "progress":
 				this.onProgress?.(msg.encodedFrames || 0);
 				break;
+			case "frame-done": {
+				const pending = this.pendingFrames.get(msg.frameId);
+				this.pendingFrames.delete(msg.frameId);
+				pending?.resolve();
+				break;
+			}
 			case "mux-start":
 				this.onMux?.();
 				break;
@@ -96,6 +107,8 @@ export class EncoderWindow {
 	};
 
 	private reject(err: Error): void {
+		for (const pending of this.pendingFrames.values()) pending.reject(err);
+		this.pendingFrames.clear();
 		if (this.rejected) {
 			return;
 		}
@@ -105,18 +118,41 @@ export class EncoderWindow {
 
 	/** 初始化编码参数（尺寸、帧率、码率），等待编码器准备好接收帧。 */
 	async init(width: number, height: number, fps: number, bitrate?: number): Promise<void> {
-		const inited = new Promise<void>(resolve => {
+		const inited = new Promise<void>((resolve, reject) => {
 			this.initedResolve = resolve;
+			this.failed = reject;
 		});
 		this.send({ type: "init", width, height, fps, bitrate });
 		await inited;
 	}
 
 	/** 推送一帧 BGRA 画面（来自离屏窗口的 paint 事件），经帧专用端口投送到编码器主世界。 */
-	pushFrame(bgra: Buffer, timestampSec: number): void {
-		if (this.framePort) {
-			this.framePort.postMessage({ bytes: bgra, timestampSec });
-		}
+	pushFrame(bgra: Buffer, timestampSec: number): Promise<void> {
+		return this.submitFrame(frameId => {
+			if (!this.framePort) throw new Error("编码器帧通道已关闭");
+			this.framePort.postMessage({ bytes: bgra, timestampSec, frameId });
+		});
+	}
+
+	/** 只传纹理引用；像素不经过主进程的 Buffer 和跨进程位图复制。 */
+	pushSharedFrame(texture: Electron.SharedTextureImported, timestampSec: number): Promise<void> {
+		return this.submitFrame(async frameId => {
+			if (!this.win || this.win.isDestroyed()) throw new Error("编码器窗口已关闭");
+			await sharedTexture.sendSharedTexture({ frame: this.win.webContents.mainFrame, importedSharedTexture: texture }, timestampSec, frameId);
+		});
+	}
+
+	private submitFrame(send: (frameId: number) => void | Promise<void>): Promise<void> {
+		const frameId = ++this.frameSequence;
+		return new Promise<void>((resolve, reject) => {
+			this.pendingFrames.set(frameId, { resolve, reject });
+			Promise.resolve()
+				.then(() => send(frameId))
+				.catch(error => {
+					this.pendingFrames.delete(frameId);
+					reject(error);
+				});
+		});
 	}
 
 	/**
@@ -147,6 +183,7 @@ export class EncoderWindow {
 
 	/** 销毁窗口并解绑监听。 */
 	close(): void {
+		this.reject(new Error("编码器已关闭"));
 		ipcMain.removeListener("encoder:to-main", this.onMessage);
 		if (this.framePort) {
 			try {

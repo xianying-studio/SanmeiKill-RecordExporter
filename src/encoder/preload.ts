@@ -1,4 +1,16 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, sharedTexture } from "electron";
+
+// VideoFrame 是可转移对象，须经 postMessage 进入主世界，不能经 contextBridge 复制。
+sharedTexture.setSharedTextureReceiver(async ({ importedSharedTexture }, timestampSec: number, frameId: number) => {
+	const frame = importedSharedTexture.getVideoFrame();
+	try {
+		window.postMessage({ type: "encoder:shared-frame", frame, timestampSec, frameId }, "*", [frame]);
+	} finally {
+		frame.close();
+		// VideoFrame 自身继续持有纹理；编码完成关闭 VideoFrame 后，Electron 才释放底层 GPU 资源。
+		importedSharedTexture.release();
+	}
+});
 
 /**
  * 「编码器」渲染窗口的 preload（隔离世界）。

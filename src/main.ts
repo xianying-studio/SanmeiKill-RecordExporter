@@ -202,6 +202,7 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 			width: RECORD_WIDTH,
 			height: RECORD_HEIGHT,
 			fps: CAPTURE_FPS,
+			frameTransport: process.env.EXPORTER_FRAME_TRANSPORT === "bitmap" ? "bitmap" : "auto",
 			speed: WAIT_COMPRESS,
 			onStage: (stage, percent) => conn.progress(stage, percent),
 			onLog: m => dlog(m),

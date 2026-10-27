@@ -24,7 +24,7 @@
 		"@types/node": "^22.10.0",
 		"@types/ws": "^8.5.13",
 		"cross-env": "^7.0.3",
-		"electron": "^33.2.0",
+		"electron": "43.8.4",
 		"electron-builder": "^25.1.8",
 		"eslint": "^9.17.0",
 		"globals": "^15.14.0",
@@ -41,20 +41,30 @@
 		"directories": {
 			"output": "release"
 		},
-		"files": ["dist/**/*", "assets/**/*", "package.json"],
+		"files": [
+			"dist/**/*",
+			"assets/**/*",
+			"package.json"
+		],
 		"protocols": [
 			{
 				"name": "SanmeiKill Record Exporter",
-				"schemes": ["sanmeikillrecordexporter"]
+				"schemes": [
+					"sanmeikillrecordexporter"
+				]
 			}
 		],
 		"win": {
 			"icon": "assets/icon.ico",
-			"target": ["nsis"]
+			"target": [
+				"nsis"
+			]
 		},
 		"mac": {
 			"icon": "assets/icon.png",
-			"target": ["dmg"],
+			"target": [
+				"dmg"
+			],
 			"category": "public.app-category.video"
 		},
 		"nsis": {
