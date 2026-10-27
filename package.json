@@ -21,6 +21,7 @@
 		"test": "pnpm build:ts && node --test tests/*.test.cjs"
 	},
 	"devDependencies": {
+		"@electron/osx-sign": "1.3.1",
 		"@eslint/js": "^9.17.0",
 		"@types/node": "^22.10.0",
 		"@types/ws": "^8.5.13",
@@ -63,6 +64,11 @@
 		},
 		"mac": {
 			"icon": "assets/icon.png",
+			"sign": "scripts/signMac.cjs",
+			"hardenedRuntime": false,
+			"entitlements": "assets/entitlements.mac.plist",
+			"entitlementsInherit": "assets/entitlements.mac.plist",
+			"timestamp": "none",
 			"target": [
 				"dmg"
 			],

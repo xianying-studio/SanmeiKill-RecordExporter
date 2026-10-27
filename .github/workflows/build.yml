@@ -43,10 +43,14 @@ jobs:
 
       - name: 打包安装包
         env:
-          # 应用版本始终为 package.json 中的 0.1.0；不进行 macOS 代码签名。
+          # 无 Developer ID 时由自定义签名钩子完整执行 ad-hoc 签名，不依赖构建机证书。
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm exec electron-builder ${{ matrix.args }} --publish never
+
+      - name: 校验 macOS 应用及全部嵌套二进制签名
+        if: runner.os == 'macOS'
+        run: node scripts/verifyMacSignatures.cjs release
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
