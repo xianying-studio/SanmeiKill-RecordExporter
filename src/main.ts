@@ -7,6 +7,7 @@ import { registerAppScheme, handleAppScheme } from "./appProtocol";
 import { recordOffscreen } from "./recorder";
 import { buildInjectScript } from "./inject";
 import { dlog } from "./debugLog";
+import type { ReceivedPackage } from "./packageTransfer";
 
 /**
  * 三梅杀录像导出工具 —— 主进程入口。
@@ -195,8 +196,15 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 	// 3. 离屏加载游戏、注入驱动脚本、压缩等待回放并逐帧编码为 MP4。
 	dlog("开始离屏录制, savePath=", savePath, "录像 payload 长度=", msg.payload.length, "等待压缩=", WAIT_COMPRESS);
 	const injectScript = buildInjectScript(linkJson, GAME_DB_NAME, GAME_CONFIG_PREFIX, WAIT_COMPRESS);
+	let localPackage: ReceivedPackage | undefined;
 	try {
+		if (msg.packageStream) {
+			conn.progress("package", 0);
+			localPackage = await conn.receivePackage(signal);
+			conn.progress("package", 100);
+		}
 		const buffer = await recordOffscreen({
+			gamePackage: localPackage?.gamePackage,
 			url: payload.baseurl,
 			injectScript,
 			width: RECORD_WIDTH,
@@ -220,6 +228,8 @@ async function runExport(payload: ExportPayload, msg: VideoMessage, conn: Export
 		dlog("录制失败:", e && e.message ? e.message : String(e));
 		console.error("[record-exporter] 录制失败：", e);
 		conn.error("录制失败：" + (e && e.message ? e.message : String(e)));
+	} finally {
+		await localPackage?.cleanup();
 	}
 }
 

@@ -1,5 +1,6 @@
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
+import { receivePackage, type ReceivedPackage } from "./packageTransfer";
 
 /** 网页端 → 工具：发送录像数据，启动导出。 */
 export interface VideoMessage {
@@ -8,6 +9,8 @@ export interface VideoMessage {
 	payload: string;
 	/** 建议的导出文件名（不含扩展名）。 */
 	filename?: string;
+	/** 新网页端可直接流式传输当前缓存中的 .smk 包体。 */
+	packageStream?: boolean;
 }
 
 /** 工具 → 网页端：进度。 */
@@ -48,6 +51,7 @@ export interface ExporterConnection {
 	done(): void;
 	error(message: string): void;
 	close(): void;
+	receivePackage(signal?: AbortSignal): Promise<ReceivedPackage>;
 }
 
 /**
@@ -161,6 +165,7 @@ function makeConnection(socket: WebSocket): ExporterConnection {
 		}
 	};
 	return {
+		receivePackage: signal => receivePackage(socket, signal),
 		progress: (stage, percent) => send({ type: "progress", stage, percent }),
 		done: () => send({ type: "done" }),
 		error: message => send({ type: "error", message }),

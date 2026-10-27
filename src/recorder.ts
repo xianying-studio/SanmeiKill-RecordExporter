@@ -1,8 +1,10 @@
-import { BrowserWindow, ipcMain } from "electron";
+import { BrowserWindow, ipcMain, session } from "electron";
+import { randomUUID } from "node:crypto";
 import path from "path";
 import { EncoderWindow } from "./encoder/encoderWindow";
 import { dlog } from "./debugLog";
 import { CapturedFrame } from "./capturedFrame";
+import type { GamePackage } from "./gamePackage";
 
 /** 录制参数。 */
 export interface RecordOptions {
@@ -30,6 +32,7 @@ export interface RecordOptions {
 	signal?: AbortSignal;
 	/** auto 优先使用 Windows/macOS 的 GPU 共享纹理；bitmap 保留兼容路径。 */
 	frameTransport?: "auto" | "shared-texture" | "bitmap";
+	gamePackage?: GamePackage;
 }
 
 /** 来自注入脚本的回报消息类型。 */
@@ -79,6 +82,15 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 	return new Promise<Buffer>((resolve, reject) => {
 		const useSharedTexture = opts.frameTransport !== "bitmap" && (process.platform === "win32" || process.platform === "darwin");
 		const pendingFrames = new Set<Promise<void>>();
+		const replaySession = opts.gamePackage ? session.fromPartition("replay-export-" + randomUUID()) : undefined;
+		if (replaySession && opts.gamePackage) {
+			const origin = new URL(opts.url).origin;
+			for (const scheme of ["http", "https"])
+				replaySession.protocol.handle(scheme, request => {
+					if (new URL(request.url).origin !== origin) return new Response("导出包体不允许外部网络请求", { status: 403 });
+					return opts.gamePackage!.response(request);
+				});
+		}
 		const speed = opts.speed && opts.speed >= 1 ? opts.speed : 1;
 		// 时间戳按真实墙钟（不做 ×speed 还原）：游戏只压缩了「等待」、动画保持自然速度，
 		// 故录制墙钟时间本身即为正确的视频时间线。speed 仅由注入脚本用于压缩等待，与时间戳无关。
@@ -239,6 +251,10 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 				offscreen.destroy();
 			}
 			offscreen = null;
+			if (replaySession) {
+				for (const scheme of ["http", "https"]) replaySession.protocol.unhandle(scheme);
+				void replaySession.clearStorageData().catch(() => {});
+			}
 			encoder.close();
 		};
 
@@ -446,6 +462,7 @@ function recordAttempt(opts: RecordOptions): Promise<Buffer> {
 					width: opts.width,
 					height: opts.height,
 					webPreferences: {
+						session: replaySession,
 						offscreen: { useSharedTexture },
 						preload: path.join(__dirname, "offscreen", "preload.js"),
 						contextIsolation: true,

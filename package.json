@@ -17,7 +17,8 @@
 		"dist:mac": "pnpm build:ts && electron-builder --mac",
 		"dist:mac:debug": "pnpm build:ts:debug && electron-builder --mac",
 		"dist:all": "pnpm build:ts && electron-builder --win --mac",
-		"lint": "eslint src"
+		"lint": "eslint src",
+		"test": "pnpm build:ts && node --test tests/*.test.cjs"
 	},
 	"devDependencies": {
 		"@eslint/js": "^9.17.0",
