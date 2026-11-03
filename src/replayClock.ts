@@ -92,6 +92,43 @@ function installReplayClock(settings: { epoch?: number; seed?: number }): void {
 			}
 		}
 	};
+	// 加载背景是原生 video，不属于 Web Animations；逐帧导出时必须等待目标画面解码，不能沿用墙钟播放。
+	const loadingVideo = () => document.getElementById("loading-background") as HTMLVideoElement | null;
+	const waitForVideo = (video: HTMLVideoElement, event: "loadeddata" | "seeked", action?: () => void) =>
+		new Promise<void>((resolve, reject) => {
+			const done = (error?: Error) => {
+				clear(timer);
+				video.removeEventListener(event, ready);
+				video.removeEventListener("error", failed);
+				if (error) reject(error);
+				else resolve();
+			};
+			const ready = () => done();
+			const failed = () => {
+				// 加载页可能正从缓存 Blob 回退到网络地址；更换 src 后继续等待新资源。
+				if (video.error) done(new Error("加载背景视频解码失败"));
+			};
+			const timer = timeout(() => done(new Error("等待加载背景视频画面超时")), 15000);
+			video.addEventListener(event, ready);
+			video.addEventListener("error", failed);
+			try {
+				action?.();
+			} catch (error) {
+				done(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	const seekLoadingVideo = async () => {
+		const video = loadingVideo();
+		if (!video || !video.isConnected || video.error) return;
+		video.pause();
+		if (video.readyState < 2) await waitForVideo(video, "loadeddata");
+		if (!Number.isFinite(video.duration) || video.duration <= 0) return;
+		const position = (time / 1000) % video.duration;
+		if (!video.seeking && Math.abs(video.currentTime - position) < 0.000001) return;
+		await waitForVideo(video, "seeked", () => {
+			video.currentTime = position;
+		});
+	};
 	// 消息任务让浏览器处理 Promise/网络回调，不受原生定时器最小延迟限制。
 	const channel = new MessageChannel();
 	let resumeHostTurn: (() => void) | undefined;
@@ -132,6 +169,7 @@ function installReplayClock(settings: { epoch?: number; seed?: number }): void {
 			}
 			time = 0;
 			active = true;
+			loadingVideo()?.pause();
 			for (const task of tasks.values()) {
 				clear(task.native);
 				// 各渲染进程加载耗时不同，进入录像时统一重新计时，避免把载入时间计入片头。
@@ -170,7 +208,10 @@ function installReplayClock(settings: { epoch?: number; seed?: number }): void {
 				await hostTurn();
 				seekAnimations();
 				// 等待布局/合成提交；不经 capturePage 或 CPU 位图截帧。
-				if (present) await new Promise<void>(resolve => raf(() => raf(() => resolve())));
+				if (present) {
+					await seekLoadingVideo();
+					await new Promise<void>(resolve => raf(() => raf(() => resolve())));
+				}
 				return time;
 			} finally {
 				stepping = false;

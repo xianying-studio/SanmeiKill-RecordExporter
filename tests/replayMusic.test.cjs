@@ -60,13 +60,14 @@ function fixture(explicit = false) {
 		ui: { backgroundMusic: audio },
 		game,
 		events: [],
-		performance: { now: () => performance.now() },
+		// 固定起点，避免 base + delay - base 的浮点误差改变恰好位于曲末的断言。
+		performance: { now: () => 0 },
 		Date,
 		Math: Object.create(Math),
 		Animation: class {
 			pause() {}
 		},
-		document: { getAnimations: () => [] },
+		document: { getAnimations: () => [], getElementById: () => null },
 		HTMLMediaElement: Media,
 		AudioContext: class {
 			async decodeAudioData(bytes) {

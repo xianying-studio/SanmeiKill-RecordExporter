@@ -10,7 +10,7 @@ afterEach(() => {
 		channel.port2.close();
 	}
 });
-function clockFixture() {
+function clockFixture(video = null) {
 	class Animation {
 		constructor() {
 			this.currentTime = 0;
@@ -30,7 +30,10 @@ function clockFixture() {
 		performance: { now: () => performance.now() },
 		Date,
 		Animation,
-		document: { getAnimations: () => [animation] },
+		document: {
+			getAnimations: () => [animation],
+			getElementById: id => (id === "loading-background" ? video : null),
+		},
 		setTimeout,
 		clearTimeout,
 		setInterval,
@@ -139,4 +142,86 @@ test("快速恢复降低早期动画采样，仍保留所有定时器与末尾�
 	assert.equal(context.frames, 1050);
 	await clock.advance(20000);
 	assert.equal(context.ticks, 200);
+});
+
+class LoadingVideo extends EventTarget {
+	isConnected = true;
+	readyState = 2;
+	duration = 2;
+	paused = false;
+	seeking = false;
+	error = null;
+	position = 1.5;
+	seekRequested = null;
+	get currentTime() {
+		return this.position;
+	}
+	set currentTime(value) {
+		this.position = value;
+		this.seeking = true;
+		if (this.seekRequested) this.seekRequested(value);
+		else queueMicrotask(() => this.decoded());
+	}
+	pause() {
+		this.paused = true;
+	}
+	decoded() {
+		this.seeking = false;
+		this.dispatchEvent(new Event("seeked"));
+	}
+}
+
+test("加载背景按成片时间播放和循环，摆脱加载耗时与编码速度的影响", async () => {
+	const video = new LoadingVideo();
+	const { clock } = clockFixture(video);
+	clock.start();
+	assert.equal(video.paused, true);
+	await clock.advance(0);
+	assert.equal(video.currentTime, 0);
+	await clock.advance(500);
+	assert.equal(video.currentTime, 0.5);
+	await clock.advance(2700);
+	assert.ok(Math.abs(video.currentTime - 0.7) < 1e-6);
+	assert.equal(video.paused, true);
+});
+
+test("目标背景画面解码完成后才提交成片帧", async () => {
+	const video = new LoadingVideo();
+	const requested = new Promise(resolve => (video.seekRequested = resolve));
+	const { clock } = clockFixture(video);
+	clock.start();
+	let submitted = false;
+	const advancing = clock.advance(500).then(() => (submitted = true));
+	assert.equal(await requested, 0.5);
+	assert.equal(submitted, false);
+	video.decoded();
+	await advancing;
+	assert.equal(submitted, true);
+});
+
+test("快进跳过背景解码，真正输出时恢复正确位置；加载页移除后停止操作视频", async () => {
+	const video = new LoadingVideo();
+	const { clock } = clockFixture(video);
+	clock.start();
+	await clock.advance(1000, false);
+	assert.equal(video.currentTime, 1.5);
+	await clock.advance(1100);
+	assert.equal(video.currentTime, 1.1);
+	video.isConnected = false;
+	await clock.advance(1600);
+	assert.equal(video.currentTime, 1.1);
+});
+
+test("背景尚未载入时等待首帧，使用原生事件完成加载而不依赖成片定时器", async () => {
+	const video = new LoadingVideo();
+	video.readyState = 0;
+	const { clock } = clockFixture(video);
+	clock.start();
+	const advancing = clock.advance(400);
+	setTimeout(() => {
+		video.readyState = 2;
+		video.dispatchEvent(new Event("loadeddata"));
+	}, 10);
+	await advancing;
+	assert.equal(video.currentTime, 0.4);
 });
